@@ -1,0 +1,10 @@
+# Built binary
+/cli/codie
+
+# Test and editor leftovers
+*.test
+*.out
+.DS_Store
+
+# Answers saved from the app while testing (Ctrl+S writes into the working dir)
+/cli/*.txt
