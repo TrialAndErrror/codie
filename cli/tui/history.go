@@ -24,7 +24,7 @@ func newHistoryView() historyView {
 	l.Title = "History"
 	l.SetShowHelp(true)
 	l.SetFilteringEnabled(true)
-	l.DisableQuitKeybindings() // esc/ctrl+c are ours: they navigate, not quit
+	l.DisableQuitKeybindings() // we own the keys: esc navigates, ctrl+c quits (see Model.Update)
 	return historyView{list: l}
 }
 
@@ -48,9 +48,6 @@ func (m Model) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.hist.list.FilterState() == list.FilterApplied {
 				break
 			}
-			m.screen = screenAsk
-			return m, nil
-		case "ctrl+c":
 			m.screen = screenAsk
 			return m, nil
 		case "enter":

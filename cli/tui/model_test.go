@@ -100,8 +100,15 @@ func (h *harness) start(q string) {
 	}
 }
 
-// tall is a long answer, so the pane has something to scroll.
-var tall = snippets[len(snippets)-1].Code
+// tall is a long answer with no code blocks, so the pane has plain text to
+// scroll (with blocks present, up/down select blocks instead).
+var tall = func() string {
+	var b strings.Builder
+	for i := 1; i <= 80; i++ {
+		fmt.Fprintf(&b, "line %d of a long plain answer\n", i)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}()
 
 // ask runs a whole question to completion with the tall answer.
 func (h *harness) ask(q string) {
@@ -308,12 +315,9 @@ func TestCopyAndSaveAreBlockedWhileStreaming(t *testing.T) {
 	h.start("q")
 	h.text("partial")
 
-	h.key(tea.KeyCtrlC)
+	h.typ("c")
 	if h.copies != 0 || !strings.Contains(h.model().status, "still answering") {
 		t.Fatalf("copy must wait: copies=%d status=%q", h.copies, h.model().status)
-	}
-	if h.model().screen != screenAnswer {
-		t.Fatal("ctrl+c on the pane must never quit")
 	}
 	h.key(tea.KeyCtrlS)
 	if h.model().saving || !strings.Contains(h.model().status, "still answering") {
@@ -366,7 +370,7 @@ func TestMidStreamErrorKeepsPartialAndDoesNotStore(t *testing.T) {
 	if len(h.store.entries) != 0 {
 		t.Fatal("an incomplete answer must not enter history")
 	}
-	h.key(tea.KeyCtrlC)
+	h.typ("c")
 	if h.copies != 0 || !strings.Contains(h.model().status, "incomplete") {
 		t.Fatalf("an incomplete answer must not be copied: status=%q", h.model().status)
 	}
@@ -541,18 +545,6 @@ func (h *harness) deliver(cmd tea.Cmd) {
 
 // ---- copy and save -------------------------------------------------------------
 
-func TestCopyWholePaneOnceFinished(t *testing.T) {
-	h := newHarness(t)
-	h.ask("copy me")
-	h.key(tea.KeyCtrlC)
-	if h.copied != tall || h.copies != 1 {
-		t.Fatal("ctrl+c should copy the raw, unwrapped answer")
-	}
-	if h.model().screen != screenAnswer {
-		t.Fatal("ctrl+c on the pane must copy, not quit")
-	}
-}
-
 func TestSaveToFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -623,7 +615,7 @@ func TestFakeResearcherStreamsInChunksAndReassembles(t *testing.T) {
 	if chunks < 5 {
 		t.Fatalf("expected a multi-chunk stream, got %d chunk(s)", chunks)
 	}
-	if b.String() != snippets[0].Code {
+	if b.String() != snippets[0].Answer {
 		t.Fatal("chunks must reassemble to the original snippet exactly")
 	}
 }
@@ -643,7 +635,7 @@ func TestFakeResearcherFailureModes(t *testing.T) {
 
 	// Neither failure consumed a snippet.
 	got, _ := backend.Collect(r.Research(context.Background(), "ok"))
-	if got != snippets[0].Code {
+	if got != snippets[0].Answer {
 		t.Fatal("failed requests must not advance the cycle")
 	}
 }
@@ -818,9 +810,10 @@ func TestEndToEndStreamIntoPane(t *testing.T) {
 	if !strings.Contains(m.View(), "fmt.Println") {
 		t.Fatal("answer not rendered")
 	}
-	h.key(tea.KeyCtrlC)
-	if h.copied != want {
-		t.Fatalf("copied %q", h.copied)
+	h.typ("j") // select the one code block
+	h.typ("c")
+	if h.copied != "fmt.Println(\"hi\")" {
+		t.Fatalf("copied %q: only the block's code, without fences, should be copied", h.copied)
 	}
 }
 

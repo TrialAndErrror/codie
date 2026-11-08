@@ -2,9 +2,13 @@
 
 A coding assistant, not a coding agent.
 
-Codie lives in your terminal. You ask it a question about how to build
-something, and it answers with a block of code you can scroll through, copy, or
-save. It never touches your files unless you tell it to save an answer.
+Codie lives in your terminal. You ask it how to build something, and it answers
+with simple, documented examples: one code block when the task is
+straightforward, or several blocks, each introduced by a line saying which file
+it belongs in. You can step through the code blocks, copy one, or save it. It
+never touches your files unless you tell it to save something.
+
+Press **Ctrl+C** at any time, on any screen, to quit.
 
 > **Preview.** Codie can answer with a real AI model through
 > [OpenRouter](https://openrouter.ai), or run in **demo mode** with sample code
@@ -52,33 +56,53 @@ When you start Codie, you get an empty text box. Type your question and press
 Your answer appears in a full-screen pane. While Codie is working you'll see a
 spinner; press **Esc** to cancel and go back if you change your mind.
 
-Answers appear as they're written. The view follows the newest text; scroll up
-to stop it following while you read. Copy and save wait until the answer is
-finished.
+Answers appear as they're written, and the view follows the newest text. Scroll
+up to stop it following while you read. Nothing can be copied or saved until the
+answer is finished.
 
-When it's finished, you can scroll through it and act on it:
+When it's finished you see the whole response: the explanation, with each code
+block drawn beside a thin bar. To work with the code:
+
+1. Press **j** (or **↓**) to jump to the first code block, or **k** (or **↑**)
+   to jump to the last. The selected block gets a heavier bar and a highlighted
+   background, and the footer says which one it is (for example
+   `block 2/3 (go)`).
+2. Keep pressing **j / k** (or **↓ / ↑**) to move between blocks. They wrap
+   around at the ends.
+3. Press **c** to copy the selected block, or **Ctrl+S** to save it.
 
 | Key | What it does |
 | --- | --- |
-| **↑ / ↓** (or **k / j**) | Scroll a line at a time |
-| **PgUp / PgDn** (or **b / f**) | Scroll a page at a time |
+| **j / ↓** | Select the first code block, then the next one |
+| **k / ↑** | Select the last code block, then the previous one |
+| **c** | Copy the selected block (just its code) |
+| **Ctrl+S** | Save the selected block, or the whole answer if none is selected |
+| **PgUp / PgDn** (or **b / f**) | Scroll a page, even with a block selected |
 | **u / d** | Scroll half a page |
-| **Ctrl+C** | Copy the whole answer to your clipboard |
-| **Ctrl+S** | Save the answer to a file |
-| **Esc** | Go back to the empty text box |
+| **g / G** | Jump to the top / bottom |
+| **Esc** | Clear the selection; press again to go back |
+| **Ctrl+C** | Quit |
 
-**Copying.** Ctrl+C copies the entire answer exactly as written, ready to
-paste into your editor. If your terminal or paste target turns tabs into
-spaces, that happens after the copy, not in Codie.
+If an answer has no code blocks (or while it's still arriving), **↑ / ↓** and
+**j / k** simply scroll.
 
-**Saving.** Ctrl+S asks for a filename, pre-filled from your question (for
-example `how-do-i-read-a-file.txt`). Edit it if you like and press **Enter**.
-The file is saved in the folder you launched Codie from. Codie will never
-overwrite an existing file; if the name is taken, you'll see a message and can
-try again with a different name. Press **Esc** to cancel.
+**Copying.** **c** copies exactly the code in the selected block: no fence
+lines, no explanation, nothing from the other blocks, and never the
+line-wrapping you see on screen. If you press **c** before selecting a block,
+Codie tells you to pick one first. If your terminal or paste target turns tabs
+into spaces, that happens after the copy, not in Codie.
 
-If a request fails, you'll see the error in the pane instead of an answer, and
-it won't be added to your history.
+**Saving.** **Ctrl+S** asks for a filename and shows what it will save. With a
+block selected it saves just that block, and the suggested name ends in the right
+extension for its language (`how-do-i-read-a-file.go`, `.py`, `.sh` and so on).
+With nothing selected it saves the whole answer as a `.txt` file. Edit the name if
+you like and press **Enter**. The file goes in the folder you launched Codie
+from. Codie will never overwrite an existing file; if the name is taken you'll
+see a message and can try again with a different name. Press **Esc** to cancel.
+
+If a request fails partway, you'll see what arrived plus the reason, but its code
+blocks can't be selected, copied or saved, because they may be incomplete. Failed
+requests are never added to your history.
 
 ### 3. History
 
@@ -104,7 +128,8 @@ The label under the title on the first screen always tells you which one you're
 using: `demo · sample answers…` or `OpenRouter · <model>`.
 
 **Demo mode** is the default when no API key is set. You get sample code
-snippets, a made-up history so the history screen has something to show, and
+snippets (some with several files' worth of code blocks, one with no code at
+all), a made-up history so the history screen has something to show, and
 nothing is sent anywhere or saved to your computer. You can also force it with
 `codie --demo`, even if a key is set.
 
@@ -142,41 +167,6 @@ nothing is sent anywhere or saved to your computer. You can also force it with
 If a key is set but the model isn't, Codie tells you what's missing. It won't
 quietly fall back to demo answers that you might mistake for real ones.
 
-### Choosing a model
-
-Codie has no default model. Any chat model on OpenRouter works, and later,
-when Codie can read your project files, you'll want one that supports tool
-calling. Prices and availability change, so treat what follows as a snapshot
-(checked 2026-11-07 against OpenRouter's public model list at
-`https://openrouter.ai/api/v1/models`, which needs no key).
-
-| Model | Rough cost per question | Questions per $1 | Notes |
-| --- | --- | --- | --- |
-| `liquid/lfm-3-1.7b:free` | free | n/a | Tiny (1.7B parameters), supports tools, thinks before it answers |
-| `mistralai/mistral-nemo` | about $0.00004 | about 26,000 | 12B, the cheapest paid model that supports tools |
-| `inclusionai/ling-3.0-tiny` | about $0.00004 | about 23,000 | Small, supports tools, thinks before it answers |
-
-("Per question" assumes roughly 500 tokens in and 800 out.)
-
-Things worth knowing:
-
-- **Free models may keep your questions.** The listing for the free model above
-  says prompts and outputs may be retained and used. Only ask free models
-  things you'd be happy to share, and check each model's page on OpenRouter.
-- **Small models make good stress tests.** They're the most likely to ignore
-  "answer with code only", ramble, or hit rate limits, which is useful for seeing
-  how Codie copes. For failures on demand with no model at all, run
-  `codie --demo` and ask a question containing `fail` (errors straight away) or
-  `midfail` (streams half an answer, then drops).
-- **Models that think first** can take a while before any text appears. The
-  spinner stays up meanwhile, and the thinking is usually billed as output.
-- **Avoid a few cheap-looking listings.** `scaledown/summarize` and
-  `scaledown/extract` aren't chat models, `openrouter/free` picks a different
-  free model each time (so results aren't repeatable), and the `:batch`
-  variants are for offline jobs.
-- **Consider a spending limit** in your OpenRouter key settings while you're
-  experimenting.
-
 ### What gets sent where
 
 In real mode:
@@ -190,6 +180,10 @@ In real mode:
 - **Your history** is saved to a file called `history.json` in Codie's folder
   inside your user config directory (on Linux, `~/.config/codie/`), and will be
   there next time you open the app. Demo mode never writes it.
+- **What comes back** is cleaned before it reaches your screen: terminal control
+  characters (the sequences that can clear your display, rewrite what's already
+  on it, or put text on your clipboard) are removed from everything the model
+  sends, and from history read back from disk.
 - Codie doesn't read or send any of your project files yet.
 
 If an answer fails partway (the connection drops, the model is cut off, or it
@@ -220,7 +214,8 @@ for the model. Ask a narrower question.
 Backspace, so Codie can't tell the difference. Try a different terminal, or
 let us know. A second shortcut is an easy addition.
 
-**Copy doesn't seem to work.** Codie uses your system clipboard when it can
+**Copy doesn't seem to work.** (Copying is **c**, on a selected code block;
+**Ctrl+C** quits.) Codie uses your system clipboard when it can
 (`xclip`, `xsel`, or `wl-copy` on Linux; built in on macOS and Windows). If none
 is installed it falls back to a terminal feature called OSC 52, which most
 modern terminals support but some disable by default. Installing `xclip` or
@@ -259,10 +254,11 @@ the machine you run it on (otherwise it falls back to OSC 52, described above).
 
 ## What's next
 
-- A tuned prompt, so answers are consistently a single block of code
+- Trying the prompt against real models and tuning it. Small models won't always
+  follow the one-block-or-several format, and Codie copes (it shows whatever
+  arrives), but the answers may be less tidy
 - Letting the model read files in your project (with your permission, one
   question at a time)
-- Selecting and copying an individual code block from an answer
 - Technical documentation for contributors
 
 ## License

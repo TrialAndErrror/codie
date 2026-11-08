@@ -797,3 +797,60 @@ func TestCollect(t *testing.T) {
 		t.Fatal("a stream that closes without a result must be an error")
 	}
 }
+
+// ---- terminal safety -------------------------------------------------------------
+
+func TestStreamedTextHasControlCharactersStripped(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		sse(w,
+			delta("safe \x1b[2J\x1b[Hcleared? "),    // clear screen + home
+			delta("\x1b]52;c;SGVsbG8=\x07copied? "), // OSC 52 clipboard write
+			delta("over\rwritten "),                 // carriage return
+			delta("c1:\u009b31m "),                  // 8-bit CSI
+			delta("tab\tand\nnewline kept"),
+			finishChunk("stop"), "[DONE]")
+	})
+	evs := drain(t, client(t, srv).Research(context.Background(), "q"))
+	got := text(evs)
+	for _, bad := range []string{"\x1b", "\x07", "\r", "\u009b"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("control character %q reached the UI: %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "tab\tand\nnewline kept") || !strings.Contains(got, "safe ") {
+		t.Fatalf("ordinary text must survive: %q", got)
+	}
+	if last(t, evs).Kind != Done {
+		t.Fatal("stream should still complete")
+	}
+}
+
+func TestNonStreamingTextHasControlCharactersStripped(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"content":"a\u001b[31mb"},"finish_reason":"stop"}]}`)
+	})
+	if got := text(drain(t, client(t, srv).Research(context.Background(), "q"))); strings.Contains(got, "\x1b") {
+		t.Fatalf("escape reached the UI: %q", got)
+	}
+}
+
+func TestErrorMessagesFromTheServerHaveControlCharactersStripped(t *testing.T) {
+	for name, h := range map[string]http.HandlerFunc{
+		"http error body": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(500)
+			io.WriteString(w, `{"error":{"message":"bad \u001b]0;pwned\u0007 thing"}}`)
+		},
+		"mid-stream error": func(w http.ResponseWriter, r *http.Request) {
+			sse(w, `{"error":{"message":"bad \u001b[2J thing"}}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			evs := drain(t, client(t, serve(t, h)).Research(context.Background(), "q"))
+			msg := last(t, evs).Err.Error()
+			if strings.ContainsAny(msg, "\x1b\x07") {
+				t.Fatalf("escape reached an error message: %q", msg)
+			}
+		})
+	}
+}

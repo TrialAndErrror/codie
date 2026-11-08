@@ -200,7 +200,7 @@ loop:
 					return
 				}
 				for _, ch := range c.Choices {
-					if ch.Delta.Content != "" && !send(Event{Kind: Text, Text: ch.Delta.Content}) {
+					if txt := Sanitize(ch.Delta.Content); txt != "" && !send(Event{Kind: Text, Text: txt}) {
 						return
 					}
 					if ch.FinishReason != nil && *ch.FinishReason != "" {
@@ -262,7 +262,7 @@ func (o *OpenRouter) readWhole(body io.Reader, send func(Event) bool, fail func(
 	}
 	var finish string
 	for _, ch := range c.Choices {
-		if ch.Message.Content != "" && !send(Event{Kind: Text, Text: ch.Message.Content}) {
+		if txt := Sanitize(ch.Message.Content); txt != "" && !send(Event{Kind: Text, Text: txt}) {
 			return
 		}
 		if ch.FinishReason != nil {
@@ -334,14 +334,16 @@ func truncate(s string, n int) string {
 }
 
 // errorf builds an error whose text can never contain the API key, even if a
-// server or the network stack echoed it back.
+// server or the network stack echoed it back, nor terminal control characters.
 func (o *OpenRouter) errorf(format string, args ...any) error {
 	return errors.New(o.redact(fmt.Sprintf(format, args...)))
 }
 
+// redact removes the API key and terminal control characters from text that
+// is about to be shown to the user.
 func (o *OpenRouter) redact(s string) string {
-	if o.cfg.APIKey == "" {
-		return s
+	if o.cfg.APIKey != "" {
+		s = strings.ReplaceAll(s, o.cfg.APIKey, "[redacted]")
 	}
-	return strings.ReplaceAll(s, o.cfg.APIKey, "[redacted]")
+	return Sanitize(s)
 }

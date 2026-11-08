@@ -3,7 +3,10 @@
 // Screens:
 //
 //	ask      empty text box                  enter: ask • ctrl+r: last answer • ctrl+h: history • esc: quit
-//	answer   scrollable response pane        esc: back • ctrl+c: copy • ctrl+s: save
+//	answer   scrollable response pane        j/k: pick a code block • c: copy it • ctrl+s: save • esc: back
+//
+// ctrl+c quits from every screen.
+//
 //	history  searchable list of past asks    enter: open • /: search • esc: back
 package tui
 
@@ -72,11 +75,15 @@ type Model struct {
 	loading     bool   // a request is in flight (streaming)
 	activity    string // latest status from the backend, e.g. "reading main.go"
 	events      <-chan backend.Event
+	blocks      []blockRef // selectable code blocks in the answer, in order; rebuilt on every render
+	sel         int        // index into blocks of the highlighted one, or -1 for none
 	cancel      context.CancelFunc
 	reqID       int
 	fromHistory bool // esc returns to history instead of the ask screen
 	saving      bool
 	saveInput   textinput.Model
+	saveText    string // exactly what the save prompt will write
+	saveWhat    string // what that is, for the prompt: "answer" or "block 2/3 (go)"
 
 	// history + "last response"
 	entries []Entry // oldest first, as stored
@@ -108,6 +115,7 @@ func New(r backend.Researcher, s Store) Model {
 		saveInput:  si,
 		spin:       sp,
 		pane:       viewport.New(80, 20),
+		sel:        -1,
 		hist:       newHistoryView(),
 	}
 	entries, err := s.Load()
@@ -156,6 +164,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m.quit() // the regular stop signal, on every screen
+		}
 		m.status = ""
 		switch m.screen {
 		case screenAsk:
@@ -169,6 +180,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Non-key messages (cursor blink, list internals) go to the active widget.
 	return m.forward(msg)
+}
+
+// quit stops the program, first cancelling any in-flight request so the
+// connection to the model is dropped rather than left generating.
+func (m Model) quit() (tea.Model, tea.Cmd) {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	return m, tea.Quit
 }
 
 // forward hands a message to whichever widget is active.
@@ -193,7 +213,7 @@ func (m Model) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateAsk(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c", "esc":
+	case "esc":
 		return m, tea.Quit
 
 	case "enter":
@@ -241,6 +261,11 @@ func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "esc":
+		if m.sel >= 0 { // first esc leaves block selection and shows the whole answer again
+			m.sel = -1
+			m.renderPane()
+			return m, nil
+		}
 		if m.loading {
 			m.cancelRequest()
 		}
@@ -250,39 +275,137 @@ func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case "ctrl+c":
-		if why := m.exportBlocked("copy"); why != "" {
-			m.status = why
+	// With code blocks to pick from, down/j and up/k move between them (first
+	// press: the first / the last block). Otherwise they fall through and scroll.
+	case "j", "down":
+		if m.canSelect() {
+			m.moveSelection(+1)
 			return m, nil
 		}
-		if err := m.copyFn(m.raw); err != nil {
-			m.status = "copy failed: " + err.Error()
-		} else {
-			m.status = "copied response to clipboard"
+	case "k", "up":
+		if m.canSelect() {
+			m.moveSelection(-1)
+			return m, nil
 		}
+
+	case "c":
+		m.copySelected()
 		return m, nil
 
 	case "ctrl+s":
-		if why := m.exportBlocked("save"); why != "" {
-			m.status = why
-			return m, nil
-		}
-		m.saving = true
-		m.saveInput.SetValue(slug(m.paneTitle) + ".txt")
-		m.saveInput.CursorEnd()
-		m.saveInput.Focus()
-		return m, textinput.Blink
+		return m.startSave()
+
+	case "g":
+		m.pane.GotoTop()
+		return m, nil
+	case "G":
+		m.pane.GotoBottom()
+		return m, nil
 	}
 
-	// Everything else (arrows, pgup/pgdn, j/k, ...) scrolls the viewport.
+	// Everything else (pgup/pgdn, space, u/d, ...) scrolls the viewport. These
+	// keep working while a block is selected, so a tall block can be read.
 	var cmd tea.Cmd
 	m.pane, cmd = m.pane.Update(msg)
 	return m, cmd
 }
 
+// canSelect reports whether code blocks can be stepped through: the answer is
+// complete and has at least one. A half-finished answer's blocks may be
+// half-finished too, so those are never offered.
+func (m Model) canSelect() bool {
+	return !m.loading && m.paneErr == "" && len(m.blocks) > 0
+}
+
+// moveSelection moves the highlight to the next (+1) or previous (-1) code
+// block, wrapping at the ends. From "nothing selected", +1 picks the first
+// block and -1 picks the last.
+func (m *Model) moveSelection(dir int) {
+	n := len(m.blocks)
+	switch {
+	case m.sel < 0 && dir > 0:
+		m.sel = 0
+	case m.sel < 0:
+		m.sel = n - 1
+	default:
+		m.sel = (m.sel + dir + n) % n
+	}
+	m.renderPane() // redraw with the new highlight (this also refreshes block positions)
+	m.revealSelection()
+}
+
+// revealSelection scrolls the minimum needed to bring the selected block into
+// view. A block taller than the pane shows its top; page down to read the rest.
+func (m *Model) revealSelection() {
+	if m.sel < 0 || m.sel >= len(m.blocks) {
+		return
+	}
+	b := m.blocks[m.sel]
+	top, height := m.pane.YOffset, m.pane.Height
+	switch {
+	case b.end-b.start+1 > height, b.start < top:
+		m.pane.SetYOffset(max(b.start-1, 0)) // keep a line of the explanation above it
+	case b.end >= top+height:
+		m.pane.SetYOffset(b.end - height + 2) // keep a line below it
+	}
+}
+
+// blockLabel names the selected block for the footer and messages,
+// e.g. "block 2/3 (go)".
+func (m Model) blockLabel() string {
+	label := fmt.Sprintf("block %d/%d", m.sel+1, len(m.blocks))
+	if lang := m.blocks[m.sel].lang; lang != "" {
+		label += " (" + lang + ")"
+	}
+	return label
+}
+
+// copySelected copies the selected code block, and only that: no fences, no
+// explanation, nothing from neighbouring blocks.
+func (m *Model) copySelected() {
+	if why := m.exportBlocked("copy"); why != "" {
+		m.status = why
+		return
+	}
+	switch {
+	case len(m.blocks) == 0:
+		m.status = "this answer has no code blocks to copy"
+	case m.sel < 0:
+		m.status = "press j or k to select a code block first"
+	default:
+		if err := m.copyFn(m.blocks[m.sel].text); err != nil {
+			m.status = "copy failed: " + err.Error()
+		} else {
+			m.status = "copied " + m.blockLabel()
+		}
+	}
+}
+
+// startSave opens the filename prompt. With a block selected it saves that
+// block (named for its language); otherwise it saves the whole answer.
+func (m Model) startSave() (tea.Model, tea.Cmd) {
+	if why := m.exportBlocked("save"); why != "" {
+		m.status = why
+		return m, nil
+	}
+	m.saveText, m.saveWhat = m.raw, "answer"
+	name := slug(m.paneTitle) + ".txt"
+	if m.sel >= 0 && m.sel < len(m.blocks) {
+		b := m.blocks[m.sel]
+		m.saveText, m.saveWhat = b.text, m.blockLabel()
+		name = slug(m.paneTitle) + extFor(b.lang)
+	}
+	m.saving = true
+	m.saveInput.Prompt = "Save " + m.saveWhat + " as: "
+	m.saveInput.SetValue(name)
+	m.saveInput.CursorEnd()
+	m.saveInput.Focus()
+	return m, textinput.Blink
+}
+
 func (m Model) updateSaving(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc", "ctrl+c":
+	case "esc":
 		m.saving = false
 		return m, nil
 	case "enter":
@@ -290,10 +413,10 @@ func (m Model) updateSaving(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if name == "" {
 			return m, nil
 		}
-		if err := saveFile(name, m.raw); err != nil {
+		if err := saveFile(name, m.saveText); err != nil {
 			m.status = errorStyle.Render("save failed: " + err.Error())
 		} else {
-			m.status = "saved to " + name
+			m.status = "saved " + m.saveWhat + " to " + name
 		}
 		m.saving = false
 		return m, nil
@@ -386,32 +509,105 @@ func (m *Model) cancelRequest() {
 }
 
 func (m *Model) openEntry(e Entry, fromHistory bool) {
-	m.showPane(e.Question, e.Answer, "")
+	// History comes from a file on disk, so sanitize it like anything else
+	// shown in the terminal.
+	m.showPane(e.Question, backend.Sanitize(e.Answer), "")
 	m.fromHistory = fromHistory
 	m.screen = screenAnswer
 }
 
 func (m *Model) showPane(title, raw, errText string) {
 	m.paneTitle, m.raw, m.paneErr = title, raw, errText
-	m.saving = false
+	m.saving, m.sel = false, -1
 	m.renderPane()
 	m.pane.GotoTop()
 }
 
+// blockRef is a selectable code block and where it sits in the rendered pane.
+type blockRef struct {
+	text, lang string
+	start, end int // first and last line of the block in the rendered content
+}
+
+var (
+	gutterStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	gutterSelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
+	codeStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	codeSelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("236"))
+)
+
+// renderPane rebuilds the pane's content from the raw answer: prose wrapped to
+// the width, each code block drawn with a left gutter, the selected block
+// highlighted. It also records where each block landed so selection can scroll
+// to it. Copy and save always use the unwrapped text, never this rendering.
 func (m *Model) renderPane() {
-	// Wrap to the pane width for display; copy/save still use m.raw untouched.
-	wrap := lipgloss.NewStyle().Width(max(m.pane.Width, 1))
-	body := ""
-	if m.raw != "" {
-		body = wrap.Render(m.raw)
+	width := max(m.pane.Width, 1)
+	prose := lipgloss.NewStyle().Width(width)
+
+	var (
+		parts  []string
+		blocks []blockRef
+		line   int
+	)
+	for _, seg := range parseAnswer(m.raw) {
+		var out string
+		if seg.Code {
+			idx := len(blocks)
+			out = renderCode(seg.Text, width, seg.selectable() && idx == m.sel)
+			if seg.selectable() {
+				blocks = append(blocks, blockRef{text: seg.Text, lang: seg.Lang(), start: line, end: line + strings.Count(out, "\n")})
+			}
+		} else {
+			out = prose.Render(seg.Text)
+		}
+		parts = append(parts, out)
+		line += strings.Count(out, "\n") + 2 // this part's lines, plus the blank line after it
 	}
 	if m.paneErr != "" {
-		if body != "" {
-			body += "\n\n"
-		}
-		body += errorStyle.Render(wrap.Render("error: " + m.paneErr))
+		parts = append(parts, errorStyle.Render(prose.Render("error: "+m.paneErr)))
 	}
-	m.pane.SetContent(body)
+
+	m.blocks = blocks
+	if m.sel >= len(blocks) {
+		m.sel = -1
+	}
+	m.pane.SetContent(strings.Join(parts, "\n\n"))
+}
+
+// renderCode draws a code block with a gutter. The selected block gets a heavier
+// gutter and a background, so it stands out even without colour support.
+func renderCode(text string, width int, selected bool) string {
+	gutter, gs, body := "│ ", gutterStyle, codeStyle
+	if selected {
+		gutter, gs, body = "▌ ", gutterSelStyle, codeSelStyle
+	}
+	lines := strings.Split(body.Width(max(width-2, 1)).Render(text), "\n")
+	for i := range lines {
+		lines[i] = gs.Render(gutter) + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// langExt maps the language on a code fence to a file extension for saving.
+var langExt = map[string]string{
+	"go": ".go", "golang": ".go", "python": ".py", "py": ".py",
+	"javascript": ".js", "js": ".js", "typescript": ".ts", "ts": ".ts", "jsx": ".jsx", "tsx": ".tsx",
+	"rust": ".rs", "rs": ".rs", "bash": ".sh", "sh": ".sh", "shell": ".sh", "zsh": ".sh",
+	"sql": ".sql", "java": ".java", "kotlin": ".kt", "swift": ".swift", "ruby": ".rb", "rb": ".rb",
+	"php": ".php", "lua": ".lua", "haskell": ".hs", "hs": ".hs",
+	"c": ".c", "cpp": ".cpp", "c++": ".cpp", "csharp": ".cs", "cs": ".cs",
+	"html": ".html", "css": ".css", "json": ".json", "yaml": ".yaml", "yml": ".yaml",
+	"toml": ".toml", "markdown": ".md", "md": ".md",
+}
+
+// extFor returns the extension for a fence language. It only ever returns
+// values from the table above (or .txt), so a model can't smuggle a path or odd
+// extension into the suggested filename.
+func extFor(lang string) string {
+	if ext, ok := langExt[lang]; ok {
+		return ext
+	}
+	return ".txt"
 }
 
 // ---- layout + view --------------------------------------------------------
@@ -427,6 +623,7 @@ func (m *Model) layout() {
 	m.saveInput.Width = max(m.w-12, 10)
 	m.hist.list.SetSize(m.w, max(m.h-2, 1))
 	m.renderPane()
+	m.revealSelection()
 }
 
 func (m Model) View() string {
@@ -474,13 +671,32 @@ func (m Model) viewAnswer() string {
 	case m.loading:
 		footer = m.spin.View() + helpStyle.Render(" "+m.progressText()+" • esc cancel")
 	default:
-		footer = helpStyle.Render(fmt.Sprintf("↑/↓ scroll • ctrl+c copy • ctrl+s save • esc back • %3.0f%%", m.pane.ScrollPercent()*100))
+		footer = helpStyle.Render(m.answerHelp())
 	}
 
 	return title + "\n\n" + body + "\n" + statusStyle.Render(m.status) + "\n" + footer
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+// answerHelp is the footer for a finished answer. It changes with what you can
+// do: with a block selected, with blocks to select, or just scrolling.
+func (m Model) answerHelp() string {
+	pct := m.pane.ScrollPercent() * 100
+	switch {
+	case m.sel >= 0:
+		return m.blockLabel() + " • j/k move • c copy • ctrl+s save block • esc deselect"
+	case m.canSelect():
+		plural := "s"
+		if len(m.blocks) == 1 {
+			plural = ""
+		}
+		return fmt.Sprintf("%d code block%s • j/k select • pgup/pgdn scroll • ctrl+s save • esc back • %3.0f%%", len(m.blocks), plural, pct)
+	case m.paneErr != "":
+		return fmt.Sprintf("↑/↓ scroll • esc back • %3.0f%%", pct)
+	}
+	return fmt.Sprintf("↑/↓ scroll • ctrl+s save • esc back • %3.0f%%", pct)
+}
 
 // progressText is what we say while waiting: the backend's latest activity if
 // it gave one, otherwise a plain "researching…".

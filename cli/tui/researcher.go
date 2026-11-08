@@ -29,8 +29,8 @@ type FakeResearcher struct {
 func (f *FakeResearcher) Research(ctx context.Context, question string) <-chan backend.Event {
 	out := make(chan backend.Event)
 	idx := f.next.Load()
-	code := snippets[idx%uint64(len(snippets))].Code
-	lines := strings.SplitAfter(code, "\n")
+	answer := snippets[idx%uint64(len(snippets))].Answer
+	lines := strings.SplitAfter(answer, "\n")
 
 	go func() {
 		defer close(out)
