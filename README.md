@@ -131,3 +131,7 @@ runs off the screen. The copied or saved text is never wrapped.
 
 - Connecting Codie to a real AI so answers are actually about your question
 - Technical documentation for contributors
+
+## License
+
+[MIT](LICENSE). Tinker away.
