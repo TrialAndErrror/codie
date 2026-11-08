@@ -812,8 +812,8 @@ func TestEndToEndStreamIntoPane(t *testing.T) {
 	}
 	h.typ("j") // select the one code block
 	h.typ("c")
-	if h.copied != "fmt.Println(\"hi\")" {
-		t.Fatalf("copied %q: only the block's code, without fences, should be copied", h.copied)
+	if want := bannered("go", "fmt.Println(\"hi\")"); h.copied != want {
+		t.Fatalf("copied %q: only the block's code, without fences, between Codie's markers (want %q)", h.copied, want)
 	}
 }
 

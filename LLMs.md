@@ -44,11 +44,12 @@ cli/
     backend.go         Event, Kind, Researcher interface (the stream contract), Collect
     config.go          Config, env var names, Validate, MaskedKey
     openrouter.go      the OpenRouter client (SSE parsing, errors, cancel, idle timeout)
-    prompt.go          DefaultSystemPrompt (the answer format the UI depends on)
+    prompt.go          DefaultSystemPrompt (the step-by-step answer format the UI depends on)
     sanitize.go        Sanitize: strips terminal control characters from untrusted text
   tui/               the Bubble Tea UI + local data
     model.go           Model, Update/View, all three screens, streaming, selection, render
     blocks.go          parseAnswer: splits an answer into prose + fenced code blocks
+    snippet.go         withBanner: Begin/End markers (as comments in the block's language) for `c`
     history.go         history screen (bubbles/list with search)
     store.go           Entry, Store interface, JSONStore (disk), memStore (memory)
     output.go          copyToClipboard, saveFile
@@ -106,7 +107,7 @@ Screens (`screen` enum): `screenAsk`, `screenAnswer`, `screenHistory`.
 | Screen | Keys |
 | --- | --- |
 | **Ask** | Enter ask · Ctrl+R last answer · Ctrl+H history · Esc quit |
-| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block · Ctrl+S save (selected block, else whole answer) · Esc deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
+| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Esc deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
 | **Save prompt** | Enter save · Esc cancel |
 | **History** | ↑/↓ move · `/` search · Enter open · Esc clear search, then back |
 | **Everywhere** | **Ctrl+C quits** (handled first in `Update`; never copies) |
@@ -126,11 +127,28 @@ Notes:
 wrapped to the width, code drawn by `renderCode` with a left gutter (`│ `
 normally, **`▌ ` + background when selected**; the glyph difference means it
 works without colour). It records each selectable block's start/end line in
-`m.blocks` (`blockRef`) so `revealSelection()` can scroll minimally to show it (a
-block taller than the pane shows its top; PgDn reads the rest).
+`m.blocks` (`blockRef`: `start`/`end` of the block, plus `intro`, the first line of
+the paragraph directly above it). Answers are a walkthrough (words, code, words,
+code), so `revealSelection()` scrolls the minimum needed to show the **step**: the
+introducing sentences *and* the block. If both fit, both come into view and a step
+already fully on screen doesn't move the view; if only the block fits it is shown
+whole with as much explanation above it as there is room for; a block taller than the
+pane shows its top and PgDn reads the rest. (Prose between fences is always one
+segment, so two prose segments are never adjacent; a block directly after another
+block has `intro == start`.)
 
 **Copy and save use the unwrapped `blockRef.text` / `m.raw`, never the rendered
 text.** Wrapping must not leak into what the user copies.
+
+**Copy markers (`snippet.go`).** `c` wraps the block in a 3-line box above and below,
+"Codie Code Snippet: Begin" / "…:  End " (the two texts are the same length so the boxes
+match), with a blank line between each box and the code. The boxes are comments in the
+block's language (`//`, `#`, `--`, `/* */`, `<!-- -->`; unknown or no language
+falls back to `#`, the style the user asked for) so pasting into a source file stays
+valid; a test parses banner-wrapped Go, Python and shell. **JSON gets no markers** (a
+comment would make it invalid; the status line says why). `C` copies the code byte for
+byte with nothing around it. **Saving never adds markers.** The code between the markers is
+never altered (tests check it byte for byte).
 
 `startSave` captures `saveText`/`saveWhat` at open time; the filename suggestion
 is `slug(question)` + `extFor(lang)` for a block (table `langExt`, anything else
@@ -190,14 +208,19 @@ tests/fake servers). `MaskedKey()` shows only whether it's set and the last 4 ch
 
 ### Prompt (`prompt.go`)
 
-`DefaultSystemPrompt` asks for: **one fenced block if the task is simple; several
-blocks otherwise, each preceded by a sentence naming the file it belongs in and how
-it relates to the others**; language on every fence; no nesting; no prose outside
-blocks beyond that; simple, idiomatic, documented code; assumptions in comments, not
-questions; plain-text prose (no markdown headings/bold/lists, it's a terminal).
-**The UI parses this format**, so changing the prompt can break selection. The
-prompt tests only guard the wording; they cannot prove a model obeys it. Only
-trying real models can.
+`DefaultSystemPrompt` asks for a **step-by-step walkthrough: words, code block, words,
+code block**: open with 2–3 plain sentences saying what is being built and the
+approach; then alternate one fenced block (one step, usually 5–25 lines) with 2–3
+sentences that say what it did and lead into the next step; **end on a code block**
+(no closing summary); say in the sentences which file a step belongs in; language on
+every fence, never nest fences; plain prose only (no headings, bold, lists or tables, it's
+a terminal); short comments in the code because the sentences carry the explanation;
+assumptions stated in the sentences rather than asking questions. (An earlier version
+asked for code only, with a single block when "simple"; tests now forbid that wording from
+creeping back.) **The UI depends on this shape**: it finds the blocks for j/k selection and
+scrolls each step into view with its introducing sentences, so changing the structure
+means checking `renderPane`/`revealSelection`. The prompt tests only guard the wording; they
+cannot prove a model obeys it. Only trying real models can.
 
 ### Sanitize (`sanitize.go`)
 
@@ -229,8 +252,11 @@ non-zero on any problem.
 
 ## 7. Demo mode content (`demo.go`, `researcher.go`)
 
-16 canned answers in the real answer format: 8 single-block, 7 multi-block (2–3
-blocks, each with a sentence saying which file it belongs in), and 1 prose-only. One
+16 canned answers: 8 single-block, 7 multi-block (2–3 blocks, each with a sentence saying
+which file it belongs in), and 1 prose-only. **Known gap: these are in the *older*
+format (code with little or no prose), not the walkthrough the prompt now asks for
+(2–3 sentences between every block), so demo mode does not yet preview what real answers
+look like.** Converting them is a content rewrite (and each split Go answer must still compile). One
 block has a very long line (wrapping); the **last** snippet is a generated 84-line
 table (scrolling). **Order matters:** the fake backend serves them in order, so the
 multi-block answers are at the *front* (the first answer has three blocks) so a few
@@ -260,7 +286,10 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - `tui/model_test.go`: harness + streaming, errors, cancel, history, save, fake backend,
   and **end-to-end tests that wire the real `OpenRouter` client into the real `Model`**
   against a local server.
-- `tui/select_test.go`: block selection, copy, save, Ctrl+C, scrolling, sanitized history.
+- `tui/select_test.go`: block selection, copy, save, Ctrl+C, scrolling, sanitized history, and
+  the walkthrough scrolling tests (`walkthrough(steps, codeLines)` builds a realistic answer).
+  `tui/snippet_test.go`: the copy markers (design matched character for character; banner-wrapped
+  Go/Python/shell still parse; JSON untouched).
 - `tui/blocks_test.go`: parser table + prefix test + fuzz. `cmd/cmd_test.go`: mode
   selection and `check`.
 - **Test harness** (`model_test.go`): `stubResearcher` returns a channel the test never
@@ -301,8 +330,10 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - Model: set by `CODIE_MODEL` / `--model`; no default.
 - Answers stream. Copy/save wait until finished.
 - Each question is independent (no conversation memory yet).
-- Answer format: prose + fenced blocks as in section 5; `j`/`k` select blocks,
-  `c` copies one, **Ctrl+C is the stop signal** (not copy).
+- Answer format: a **walkthrough**, words / code block / words / code block, 2–3 sentences between
+  blocks, so j/k step through the work gently. `j`/`k` select blocks, `c` copies one **with Begin/End
+  markers** (comments in the block's language; the user's requested look), `C` copies it plain,
+  **Ctrl+C is the stop signal** (not copy).
 - File reading (not built yet): the model *asks* for files via tool calls;
   root = git root, else the current directory; **approval once per question**
   before the first read; read-only tools only.

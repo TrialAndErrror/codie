@@ -2,11 +2,11 @@
 
 A coding assistant, not a coding agent.
 
-Codie lives in your terminal. You ask it how to build something, and it answers
-with simple, documented examples: one code block when the task is
-straightforward, or several blocks, each introduced by a line saying which file
-it belongs in. You can step through the code blocks, copy one, or save it. It
-never touches your files unless you tell it to save something.
+Codie lives in your terminal. You ask it how to build something, and it walks
+you through it step by step: a few sentences explaining the next step, then a short
+code block, then a few more sentences, then the next block. You can step through
+the code blocks, copy one, or save it. It never touches your files unless you tell
+it to save something.
 
 Press **Ctrl+C** at any time, on any screen, to quit.
 
@@ -60,22 +60,26 @@ Answers appear as they're written, and the view follows the newest text. Scroll
 up to stop it following while you read. Nothing can be copied or saved until the
 answer is finished.
 
-When it's finished you see the whole response: the explanation, with each code
-block drawn beside a thin bar. To work with the code:
+When it's finished you see the whole response, written as a walkthrough: a few
+sentences, a code block, a few sentences, the next block, each code block drawn
+beside a thin bar. To work through it:
 
 1. Press **j** (or **↓**) to jump to the first code block, or **k** (or **↑**)
    to jump to the last. The selected block gets a heavier bar and a highlighted
    background, and the footer says which one it is (for example
    `block 2/3 (go)`).
 2. Keep pressing **j / k** (or **↓ / ↑**) to move between blocks. They wrap
-   around at the ends.
-3. Press **c** to copy the selected block, or **Ctrl+S** to save it.
+   around at the ends. Each press brings the step into view together with the
+   sentences that introduce it, so it reads like turning a page.
+3. Press **c** to copy the selected block (with markers around it), **C** to copy
+   just the code, or **Ctrl+S** to save it.
 
 | Key | What it does |
 | --- | --- |
 | **j / ↓** | Select the first code block, then the next one |
 | **k / ↑** | Select the last code block, then the previous one |
-| **c** | Copy the selected block (just its code) |
+| **c** | Copy the selected block, wrapped in Begin / End markers |
+| **C** | Copy the selected block as plain code, with no markers |
 | **Ctrl+S** | Save the selected block, or the whole answer if none is selected |
 | **PgUp / PgDn** (or **b / f**) | Scroll a page, even with a block selected |
 | **u / d** | Scroll half a page |
@@ -86,11 +90,32 @@ block drawn beside a thin bar. To work with the code:
 If an answer has no code blocks (or while it's still arriving), **↑ / ↓** and
 **j / k** simply scroll.
 
-**Copying.** **c** copies exactly the code in the selected block: no fence
-lines, no explanation, nothing from the other blocks, and never the
-line-wrapping you see on screen. If you press **c** before selecting a block,
-Codie tells you to pick one first. If your terminal or paste target turns tabs
-into spaces, that happens after the copy, not in Codie.
+**Copying.** **c** copies the code in the selected block and nothing else: no
+fence lines, no explanation, nothing from the other blocks, and never the
+line-wrapping you see on screen. It puts a marker above and below, so once the
+code is pasted you can see where the snippet starts and ends:
+
+```
+#############################
+# Codie Code Snippet: Begin #
+#############################
+
+def main():
+    pass
+
+#############################
+# Codie Code Snippet:  End  #
+#############################
+```
+
+The markers are comments in the snippet's own language, so pasting them into a
+source file doesn't break it: `//` for Go, JavaScript, Rust, Java and similar,
+`--` for SQL and Haskell, `/* */` for CSS, `<!-- -->` for HTML, and `#` for
+Python, shell and anything else. JSON has no comments, so it is copied without
+markers. Press **C** instead when you want exactly the code with nothing around it,
+for example when pasting straight into a file. If you press **c** or **C** before
+selecting a block, Codie tells you to pick one first. If your terminal or paste
+target turns tabs into spaces, that happens after the copy, not in Codie.
 
 **Saving.** **Ctrl+S** asks for a filename and shows what it will save. With a
 block selected it saves just that block, and the suggested name ends in the right
@@ -99,6 +124,7 @@ With nothing selected it saves the whole answer as a `.txt` file. Edit the name 
 you like and press **Enter**. The file goes in the folder you launched Codie
 from. Codie will never overwrite an existing file; if the name is taken you'll
 see a message and can try again with a different name. Press **Esc** to cancel.
+Saved files never include the copy markers.
 
 If a request fails partway, you'll see what arrived plus the reason, but its code
 blocks can't be selected, copied or saved, because they may be incomplete. Failed

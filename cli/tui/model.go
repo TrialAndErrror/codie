@@ -289,7 +289,10 @@ func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "c":
-		m.copySelected()
+		m.copySelected(false) // with begin/end markers
+		return m, nil
+	case "C":
+		m.copySelected(true) // plain code, exactly as written
 		return m, nil
 
 	case "ctrl+s":
@@ -377,8 +380,11 @@ func (m Model) blockLabel() string {
 }
 
 // copySelected copies the selected code block, and only that: no fences, no
-// explanation, nothing from neighbouring blocks.
-func (m *Model) copySelected() {
+// explanation, nothing from neighbouring blocks, and never the line wrapping seen
+// on screen. By default the code is wrapped in Codie begin/end banners (see
+// snippet.go) so it is clear where it starts and ends once pasted; plain copies
+// exactly the code and nothing else.
+func (m *Model) copySelected(plain bool) {
 	if why := m.exportBlocked("copy"); why != "" {
 		m.status = why
 		return
@@ -386,15 +392,26 @@ func (m *Model) copySelected() {
 	switch {
 	case len(m.blocks) == 0:
 		m.status = "this answer has no code blocks to copy"
+		return
 	case m.sel < 0:
 		m.status = "press j or k to select a code block first"
-	default:
-		if err := m.copyFn(m.blocks[m.sel].text); err != nil {
-			m.status = "copy failed: " + err.Error()
+		return
+	}
+
+	b := m.blocks[m.sel]
+	text, note := b.text, " as plain code"
+	if !plain {
+		if wrapped, ok := withBanner(b.lang, b.text); ok {
+			text, note = wrapped, " with begin/end markers"
 		} else {
-			m.status = "copied " + m.blockLabel()
+			note = " (" + b.lang + " has no comments, so no markers)"
 		}
 	}
+	if err := m.copyFn(text); err != nil {
+		m.status = "copy failed: " + err.Error()
+		return
+	}
+	m.status = "copied " + m.blockLabel() + note
 }
 
 // startSave opens the filename prompt. With a block selected it saves that
@@ -711,7 +728,7 @@ func (m Model) answerHelp() string {
 	pct := m.pane.ScrollPercent() * 100
 	switch {
 	case m.sel >= 0:
-		return m.blockLabel() + " • j/k move • c copy • ctrl+s save block • esc deselect"
+		return m.blockLabel() + " • j/k move • c copy • C plain • ctrl+s save • esc deselect"
 	case m.canSelect():
 		plural := "s"
 		if len(m.blocks) == 1 {

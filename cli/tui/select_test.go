@@ -265,17 +265,17 @@ func TestCopyCopiesExactlyTheSelectedBlock(t *testing.T) {
 
 	h.typ("j")
 	h.typ("c")
-	if h.copied != blockA || h.model().status != "copied block 1/3 (go)" {
+	if h.copied != bannered("go", blockA) || h.model().status != "copied block 1/3 (go) with begin/end markers" {
 		t.Fatalf("copied %q, status %q", h.copied, h.model().status)
 	}
 	h.typ("j")
 	h.typ("c")
-	if h.copied != blockB {
+	if h.copied != bannered("go", blockB) {
 		t.Fatalf("copied %q, want block B", h.copied)
 	}
 	h.typ("j")
 	h.typ("c")
-	if h.copied != blockC || h.model().status != "copied block 3/3 (sh)" {
+	if h.copied != bannered("sh", blockC) || h.model().status != "copied block 3/3 (sh) with begin/end markers" {
 		t.Fatalf("copied %q, status %q", h.copied, h.model().status)
 	}
 	if h.copies != 3 {
@@ -294,8 +294,12 @@ func TestCopyKeepsTabsAndBlankLinesExactly(t *testing.T) {
 	h.answerWith("q", "Do this:\n"+f+"go\n"+code+"\n"+f)
 	h.typ("j")
 	h.typ("c")
+	if want := bannered("go", code); h.copied != want {
+		t.Fatalf("copy altered the code:\n got %q\nwant %q", h.copied, want)
+	}
+	h.typ("C") // the plain copy is the code and nothing else
 	if h.copied != code {
-		t.Fatalf("copy altered the code:\n got %q\nwant %q", h.copied, code)
+		t.Fatalf("plain copy altered the code:\n got %q\nwant %q", h.copied, code)
 	}
 }
 
@@ -306,8 +310,12 @@ func TestCopyIsUnaffectedByWrapping(t *testing.T) {
 	h.send(tea.WindowSizeMsg{Width: 40, Height: 20}) // forces heavy wrapping
 	h.typ("j")
 	h.typ("c")
-	if h.copied != long {
+	if h.copied != bannered("go", long) {
 		t.Fatalf("wrapping leaked into the copied text: %q", h.copied)
+	}
+	h.typ("C")
+	if h.copied != long {
+		t.Fatalf("wrapping leaked into the plain copy: %q", h.copied)
 	}
 }
 
@@ -378,7 +386,7 @@ func TestBlocksCannotBeSelectedWhileStreaming(t *testing.T) {
 		t.Fatal("after Done the block should be selectable")
 	}
 	h.typ("c")
-	if h.copied != "func partial() {\n}" {
+	if h.copied != bannered("go", "func partial() {\n}") {
 		t.Fatalf("copied %q", h.copied)
 	}
 }
@@ -563,7 +571,7 @@ func TestBlocksWorkOnAnswersOpenedFromHistory(t *testing.T) {
 	}
 	h.typ("k") // last block
 	h.typ("c")
-	if h.copied != blockC {
+	if h.copied != bannered("sh", blockC) {
 		t.Fatalf("copied %q", h.copied)
 	}
 	h.key(tea.KeyEsc) // deselect
@@ -840,5 +848,51 @@ func TestAStepThatExactlyFillsThePaneKeepsItsFirstLine(t *testing.T) {
 	v := h.model().View()
 	if !strings.Contains(v, "STEP2 intro") || !strings.Contains(v, "step2_line8()") {
 		t.Fatalf("a step that exactly fits must show its first line and its last line (offset %d):\n%s", h.model().pane.YOffset, v)
+	}
+}
+
+// A block that follows another block directly has no explanation of its own. It
+// must not borrow the paragraph above the previous block.
+func TestABlockRightAfterAnotherBlockDoesNotBorrowTheEarlierExplanation(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", "Some words first.\n"+f+"go\na()\n"+f+"\n"+f+"go\nb()\n"+f)
+	blocks := h.model().blocks
+	if len(blocks) != 2 {
+		t.Fatalf("blocks: %d", len(blocks))
+	}
+	if blocks[0].intro >= blocks[0].start {
+		t.Fatal("the first block has words above it")
+	}
+	if blocks[1].intro != blocks[1].start {
+		t.Fatalf("the second block follows a block directly, so it has no explanation (intro=%d start=%d)", blocks[1].intro, blocks[1].start)
+	}
+}
+
+// A step that is already fully on screen must not move the view, wherever the
+// view happens to be. Otherwise j would nudge the page around for no reason.
+func TestAStepAlreadyFullyOnScreenDoesNotScroll(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(6, 3)) // short steps, several fit on one screen
+	m := h.model()
+	m.pane.SetYOffset(12) // somewhere in the middle
+	m.renderPane()
+	top, height := m.pane.YOffset, m.pane.Height
+
+	checked := 0
+	for i, b := range m.blocks {
+		if b.intro >= top && b.end < top+height {
+			m.sel = i
+			m.renderPane()
+			m.pane.SetYOffset(top)
+			m.revealSelection()
+			if m.pane.YOffset != top {
+				t.Fatalf("step %d is fully visible (lines %d-%d, view %d-%d) but the view moved to %d",
+					i+1, b.intro, b.end, top, top+height-1, m.pane.YOffset)
+			}
+			checked++
+		}
+	}
+	if checked < 2 {
+		t.Fatalf("setup: expected several steps visible at once, only %d were", checked)
 	}
 }
