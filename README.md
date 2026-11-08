@@ -142,6 +142,41 @@ nothing is sent anywhere or saved to your computer. You can also force it with
 If a key is set but the model isn't, Codie tells you what's missing. It won't
 quietly fall back to demo answers that you might mistake for real ones.
 
+### Choosing a model
+
+Codie has no default model. Any chat model on OpenRouter works, and later,
+when Codie can read your project files, you'll want one that supports tool
+calling. Prices and availability change, so treat what follows as a snapshot
+(checked 2026-11-07 against OpenRouter's public model list at
+`https://openrouter.ai/api/v1/models`, which needs no key).
+
+| Model | Rough cost per question | Questions per $1 | Notes |
+| --- | --- | --- | --- |
+| `liquid/lfm-3-1.7b:free` | free | n/a | Tiny (1.7B parameters), supports tools, thinks before it answers |
+| `mistralai/mistral-nemo` | about $0.00004 | about 26,000 | 12B, the cheapest paid model that supports tools |
+| `inclusionai/ling-3.0-tiny` | about $0.00004 | about 23,000 | Small, supports tools, thinks before it answers |
+
+("Per question" assumes roughly 500 tokens in and 800 out.)
+
+Things worth knowing:
+
+- **Free models may keep your questions.** The listing for the free model above
+  says prompts and outputs may be retained and used. Only ask free models
+  things you'd be happy to share, and check each model's page on OpenRouter.
+- **Small models make good stress tests.** They're the most likely to ignore
+  "answer with code only", ramble, or hit rate limits, which is useful for seeing
+  how Codie copes. For failures on demand with no model at all, run
+  `codie --demo` and ask a question containing `fail` (errors straight away) or
+  `midfail` (streams half an answer, then drops).
+- **Models that think first** can take a while before any text appears. The
+  spinner stays up meanwhile, and the thinking is usually billed as output.
+- **Avoid a few cheap-looking listings.** `scaledown/summarize` and
+  `scaledown/extract` aren't chat models, `openrouter/free` picks a different
+  free model each time (so results aren't repeatable), and the `:batch`
+  variants are for offline jobs.
+- **Consider a spending limit** in your OpenRouter key settings while you're
+  experimenting.
+
 ### What gets sent where
 
 In real mode:
