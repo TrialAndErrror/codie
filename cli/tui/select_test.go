@@ -675,3 +675,170 @@ func TestTheLastDemoAnswerIsTheTallScrollTest(t *testing.T) {
 		t.Fatalf("the last demo answer should be taller than a terminal (%d lines): %q", n, last.Question)
 	}
 }
+
+// ---- the walkthrough format: words, code, words, code -------------------------------------
+
+// walkthrough builds an answer shaped the way the prompt asks for: a few
+// sentences, a short block, a few sentences, the next block, ending on a block.
+// Every step has a unique marker at the start of its explanation and a unique
+// last line of code, so a test can tell what is on screen.
+func walkthrough(steps, codeLines int) string {
+	var parts []string
+	for i := 1; i <= steps; i++ {
+		parts = append(parts, fmt.Sprintf("STEP%d intro. This is the first of three sentences explaining what step %d does and why. "+
+			"Here is the second sentence, which adds a little more detail about the approach taken here. "+
+			"The third sentence leads into the code that follows.", i, i))
+		parts = append(parts, f+"go")
+		for l := 0; l < codeLines; l++ {
+			parts = append(parts, fmt.Sprintf("\tstep%d_line%d()", i, l))
+		}
+		parts = append(parts, f)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func TestWalkthroughParsesAsAlternatingWordsAndCode(t *testing.T) {
+	segs := parseAnswer(walkthrough(4, 6))
+	if len(segs) != 8 {
+		t.Fatalf("want 4 explanations + 4 blocks = 8 segments, got %d", len(segs))
+	}
+	for i, seg := range segs {
+		wantCode := i%2 == 1
+		if seg.Code != wantCode {
+			t.Fatalf("segment %d: code=%v, want %v (words, code, words, code…)", i, seg.Code, wantCode)
+		}
+	}
+	if !strings.HasPrefix(segs[0].Text, "STEP1 intro") || !segs[len(segs)-1].Code {
+		t.Fatal("a walkthrough starts with words and ends on a block")
+	}
+}
+
+func TestBlocksRememberTheExplanationAboveThem(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(3, 6))
+	blocks := h.model().blocks
+	if len(blocks) != 3 {
+		t.Fatalf("blocks: %d", len(blocks))
+	}
+	for i, b := range blocks {
+		if b.intro >= b.start {
+			t.Errorf("block %d: its explanation should start above it (intro=%d start=%d)", i+1, b.intro, b.start)
+		}
+		// the explanation is a paragraph of a few lines, then a blank line, then the block
+		if gap := b.start - b.intro; gap < 3 || gap > 8 {
+			t.Errorf("block %d: expected a few lines of explanation, got a gap of %d", i+1, gap)
+		}
+		if i > 0 && b.intro <= blocks[i-1].end {
+			t.Errorf("block %d's explanation (%d) overlaps the previous block (ends %d)", i+1, b.intro, blocks[i-1].end)
+		}
+	}
+}
+
+func TestBlocksWithoutExplanationUseTheirOwnStart(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", f+"go\na()\n"+f+"\n"+f+"go\nb()\n"+f) // two blocks back to back, no words
+	for i, b := range h.model().blocks {
+		if b.intro != b.start {
+			t.Errorf("block %d has no explanation, so intro should equal start (intro=%d start=%d)", i+1, b.intro, b.start)
+		}
+	}
+}
+
+func TestEachStepScrollsIntoViewTogetherWithItsExplanation(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(5, 9)) // taller than the 26-row pane, so it must scroll
+
+	if h.model().pane.TotalLineCount() <= h.model().pane.Height {
+		t.Fatal("setup: the answer should need scrolling")
+	}
+	for i := 1; i <= 5; i++ {
+		h.typ("j")
+		v := h.model().View()
+		intro := fmt.Sprintf("STEP%d intro", i)
+		last := fmt.Sprintf("step%d_line8()", i)
+		if !strings.Contains(v, intro) || !strings.Contains(v, last) || !strings.Contains(v, "▌") {
+			t.Fatalf("step %d: its explanation and its whole block should both be on screen (offset %d):\n%s", i, h.model().pane.YOffset, v)
+		}
+	}
+}
+
+func TestSteppingBackwardAlsoShowsTheExplanation(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(5, 9))
+	h.typ("k") // from nothing: the last step
+	if v := h.model().View(); !strings.Contains(v, "STEP5 intro") || !strings.Contains(v, "step5_line8()") {
+		t.Fatalf("the last step should show its explanation and its block:\n%s", v)
+	}
+	for i := 4; i >= 1; i-- {
+		h.typ("k")
+		v := h.model().View()
+		if !strings.Contains(v, fmt.Sprintf("STEP%d intro", i)) || !strings.Contains(v, fmt.Sprintf("step%d_line8()", i)) {
+			t.Fatalf("step %d going backward: explanation and block should both show:\n%s", i, v)
+		}
+	}
+}
+
+func TestSteppingForwardMovesGentlyNeverBackwardsAndNeverMoreThanAPage(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(6, 9))
+	h.typ("g")
+	prev := h.model().pane.YOffset
+	for i := 1; i <= 6; i++ {
+		h.typ("j")
+		off := h.model().pane.YOffset
+		if off < prev {
+			t.Fatalf("step %d: scrolled backwards (%d -> %d) while moving forward", i, prev, off)
+		}
+		if off-prev > h.model().pane.Height {
+			t.Fatalf("step %d: jumped %d lines, more than a page (%d)", i, off-prev, h.model().pane.Height)
+		}
+		prev = off
+	}
+}
+
+func TestAnExplanationTooLongToShowWithItsBlockStillShowsTheWholeBlock(t *testing.T) {
+	h := newHarness(t)
+	var long []string
+	for i := 0; i < 30; i++ { // a 30-line explanation, taller than the pane with the block
+		long = append(long, fmt.Sprintf("explanation line %d", i))
+	}
+	h.answerWith("q", strings.Join(long, "\n")+"\n"+f+"go\nfirst()\nsecond()\nthird()\n"+f)
+	h.typ("j")
+	v := h.model().View()
+	if !strings.Contains(v, "first()") || !strings.Contains(v, "third()") || !strings.Contains(v, "explanation line 29") {
+		t.Fatalf("the whole block, and the end of its explanation, should show:\n%s", v)
+	}
+}
+
+func TestFirstStepIsAlreadyInViewWhenTheAnswerStartsAtTheTop(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(3, 6))
+	h.typ("g")
+	before := h.model().pane.YOffset
+	h.typ("j")
+	if h.model().pane.YOffset != before {
+		t.Fatal("when the first step is already fully on screen, pressing j should highlight it without scrolling")
+	}
+}
+
+// A step whose explanation plus block exactly fills the pane is the tightest case:
+// an off-by-one in the scroll would push the first line of the explanation off
+// the top.
+func TestAStepThatExactlyFillsThePaneKeepsItsFirstLine(t *testing.T) {
+	h := newHarness(t)
+	h.answerWith("q", walkthrough(3, 9))
+	b := h.model().blocks[1]
+	span := b.end - b.intro + 1
+
+	h.send(tea.WindowSizeMsg{Width: 100, Height: span + chrome}) // pane height == span
+	if got := h.model().pane.Height; got != span {
+		t.Fatalf("setup: pane height %d, want %d", got, span)
+	}
+	h.typ("g")
+	h.typ("j")
+	h.typ("j") // step 2, which starts below the top of the view
+	v := h.model().View()
+	if !strings.Contains(v, "STEP2 intro") || !strings.Contains(v, "step2_line8()") {
+		t.Fatalf("a step that exactly fits must show its first line and its last line (offset %d):\n%s", h.model().pane.YOffset, v)
+	}
+}

@@ -334,19 +334,35 @@ func (m *Model) moveSelection(dir int) {
 	m.revealSelection()
 }
 
-// revealSelection scrolls the minimum needed to bring the selected block into
-// view. A block taller than the pane shows its top; page down to read the rest.
+// revealSelection scrolls the minimum needed to show the selected step: the
+// sentences that introduce the block, then the block itself. Answers are written
+// as a walkthrough (words, code, words, code), so stepping with j/k should read
+// like turning a page, not drop you onto bare code with its explanation off the
+// top of the screen.
+//
+//   - If the explanation and the block both fit, both are brought into view.
+//   - If the block fits but explanation and block together don't, the block is
+//     shown whole, with as much of the explanation above it as there is room for.
+//   - A block taller than the pane shows its top; page down to read the rest.
 func (m *Model) revealSelection() {
 	if m.sel < 0 || m.sel >= len(m.blocks) {
 		return
 	}
 	b := m.blocks[m.sel]
 	top, height := m.pane.YOffset, m.pane.Height
+	blockHeight := b.end - b.start + 1
+	span := b.end - b.intro + 1
 	switch {
-	case b.end-b.start+1 > height, b.start < top:
-		m.pane.SetYOffset(max(b.start-1, 0)) // keep a line of the explanation above it
+	case blockHeight > height:
+		m.pane.SetYOffset(max(b.start-1, 0))
+	case span > height:
+		m.pane.SetYOffset(b.end - height + 1)
+	case b.intro < top:
+		m.pane.SetYOffset(b.intro)
 	case b.end >= top+height:
-		m.pane.SetYOffset(b.end - height + 2) // keep a line below it
+		// Scroll down just far enough, keeping a line of whatever follows in view
+		// as a cue that there is more, without pushing the explanation off the top.
+		m.pane.SetYOffset(min(b.end-height+2, b.intro))
 	}
 }
 
@@ -527,6 +543,9 @@ func (m *Model) showPane(title, raw, errText string) {
 type blockRef struct {
 	text, lang string
 	start, end int // first and last line of the block in the rendered content
+	// intro is the first line of the prose paragraph directly above the block (the
+	// sentences that introduce this step), or start if the block has none.
+	intro int
 }
 
 var (
@@ -545,9 +564,10 @@ func (m *Model) renderPane() {
 	prose := lipgloss.NewStyle().Width(width)
 
 	var (
-		parts  []string
-		blocks []blockRef
-		line   int
+		parts      []string
+		blocks     []blockRef
+		line       int
+		proseStart = -1 // first line of the prose part just before this one, or -1
 	)
 	for _, seg := range parseAnswer(m.raw) {
 		var out string
@@ -555,10 +575,16 @@ func (m *Model) renderPane() {
 			idx := len(blocks)
 			out = renderCode(seg.Text, width, seg.selectable() && idx == m.sel)
 			if seg.selectable() {
-				blocks = append(blocks, blockRef{text: seg.Text, lang: seg.Lang(), start: line, end: line + strings.Count(out, "\n")})
+				intro := line
+				if proseStart >= 0 {
+					intro = proseStart
+				}
+				blocks = append(blocks, blockRef{text: seg.Text, lang: seg.Lang(), start: line, end: line + strings.Count(out, "\n"), intro: intro})
 			}
+			proseStart = -1
 		} else {
 			out = prose.Render(seg.Text)
+			proseStart = line
 		}
 		parts = append(parts, out)
 		line += strings.Count(out, "\n") + 2 // this part's lines, plus the blank line after it
