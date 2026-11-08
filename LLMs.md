@@ -33,6 +33,7 @@ otherwise. (Planned file *reading* is allowed and described in section 9.)
 README.md            user-facing docs (install, keys, modes, model tips, troubleshooting)
 LLMs.md              this file
 LICENSE              MIT
+example.env          template for the 3 env vars; Codie does NOT load .env itself (user sources it)
 cli/
   main.go            calls cmd.Execute()
   cmd/               CLI wiring (Cobra): flags, mode selection, `codie check`
@@ -210,8 +211,11 @@ Found by fuzzing.
 
 Prints the config (key masked), the mode, and problems. **Without `--live` it makes
 no network request** (a test enforces this). `--live` sends one request:
-system "Reply with exactly one word.", `max_tokens` 16, question "Say: ok", 60 s
-timeout. Errors are printed once (`SilenceErrors` on the subcommand). Exit code is
+system "Reply with exactly one word.", `max_tokens` 256 (`liveCheckMaxTokens`), question "Say: ok", 60 s
+timeout. A reply cut off by that cap (`errors.Is(err, backend.ErrTruncated)`) still counts as
+a **pass**: models that think before answering (GLM, DeepSeek, Haiku 5.5 all report
+`reasoning`) can burn the cap on thinking and finish with `length`, but the request
+clearly worked. Errors are printed once (`SilenceErrors` on the subcommand). Exit code is
 non-zero on any problem.
 
 ## 6. Data
@@ -302,15 +306,24 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - File reading (not built yet): the model *asks* for files via tool calls;
   root = git root, else the current directory; **approval once per question**
   before the first read; read-only tools only.
+- Models: the user must use **Haiku, GLM or DeepSeek, and only ones with a
+  zero-data-retention (ZDR) endpoint on OpenRouter**. `example.env` lists the picks.
+  **Codie does not enforce ZDR in code** (the user chose not to). Enforcement is the
+  user's OpenRouter account privacy settings. Do not claim the app guarantees ZDR.
+  Caveats from OpenRouter's docs: safety-retention endpoints exist, and Google Vertex
+  endpoints are not strict ZDR (relevant to Haiku, which is served by Bedrock and
+  Google). The ZDR endpoint list is public: `https://openrouter.ai/api/v1/endpoints/zdr`.
 - License MIT. `README.md` stays non-technical; technical docs come after the backend.
 
 **Done:** TUI (ask/answer/history), demo mode, streaming OpenRouter backend,
 `codie check`, mode selection, prompt v1, block selection/copy/save, sanitizing.
 
 **Next (in rough order)**
-1. Run `codie check --live` and real questions on a cheap model (README lists
-   candidates: a tiny free model is the best worst-case test; free models may retain
-   prompts, so only throwaway questions). Then tune the prompt from real output.
+1. Run `codie check --live` and real questions on a cheap model (`example.env` and
+   the README's "Choosing a model" list ZDR-capable Haiku/GLM/DeepSeek picks; the
+   README deliberately does not list free models any more, and free models may
+   retain prompts, so only throwaway questions on those). Then tune the prompt from
+   real output.
 2. File tools: read file / list dir / search; guardrails: stay inside the root,
    refuse symlink escapes, respect `.gitignore`, skip secrets (`.env`, keys), cap file
    sizes and tool calls per question; the approval prompt; emit `Activity` events

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -12,6 +13,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// liveCheckMaxTokens caps the reply to `check --live`. It is tiny in cost (a
+// fraction of a cent) but roomy enough for a model that thinks first to finish a
+// one-word answer.
+const liveCheckMaxTokens = 256
+
 var checkLive bool
 
 var checkCmd = &cobra.Command{
@@ -20,7 +26,7 @@ var checkCmd = &cobra.Command{
 	Long: `Show which backend Codie would use and whether your settings are complete.
 
 By default this only reads your environment: it makes no network requests and
-spends nothing. Add --live to send one tiny test request to OpenRouter (a few
+spends nothing. Add --live to send one tiny test request to OpenRouter (capped at 256
 tokens, a fraction of a cent) and confirm your key and model really work.`,
 	Args:         cobra.NoArgs,
 	SilenceUsage: true,
@@ -77,18 +83,31 @@ func runCheck(ctx context.Context, w io.Writer, cfg backend.Config, live bool) e
 		return err
 	}
 	o.System = "Reply with exactly one word."
-	o.MaxTokens = 16
+	o.MaxTokens = liveCheckMaxTokens
 
 	fmt.Fprintf(w, "\nSending one tiny test request to %s using model %s…\n", cfg.BaseURL, cfg.Model)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	start := time.Now()
 	reply, err := backend.Collect(o.Research(ctx, "Say: ok"))
-	if err != nil {
+	elapsed := time.Since(start).Round(time.Millisecond)
+	switch {
+	case errors.Is(err, backend.ErrTruncated):
+		// The model answered but ran out of tokens, which models that think
+		// before replying often do on a tiny cap. The request clearly worked
+		// (key, model, guardrails and routing are all fine), so this is a pass.
+		fmt.Fprintf(w, "OK. Your key, model and routing work (a reply streamed back in %s).\n", elapsed)
+		fmt.Fprintf(w, "The model used up the %d-token test limit before finishing, which is normal for models\n", liveCheckMaxTokens)
+		fmt.Fprintln(w, "that think before they answer. Real questions don't use this limit.")
+		if r := snippet(reply, 80); r != "" {
+			fmt.Fprintf(w, "What it had said so far: %q\n", r)
+		}
+		return nil
+	case err != nil:
 		fmt.Fprintf(w, "Failed: %v\n", err)
 		return err
 	}
-	fmt.Fprintf(w, "OK. A streamed reply arrived in %s: %q\n", time.Since(start).Round(time.Millisecond), snippet(reply, 80))
+	fmt.Fprintf(w, "OK. A streamed reply arrived in %s: %q\n", elapsed, snippet(reply, 80))
 	return nil
 }
 

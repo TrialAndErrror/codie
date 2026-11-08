@@ -232,7 +232,7 @@ func TestCheckLiveRequestIsTiny(t *testing.T) {
 	if err := runCheck(context.Background(), &out, localCfg(srv), true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got, `"max_tokens":16`) || len(got) > 400 {
+	if !strings.Contains(got, `"max_tokens":256`) || len(got) > 400 {
 		t.Fatalf("the test request should be capped and small (%d bytes): %s", len(got), got)
 	}
 }
@@ -243,5 +243,76 @@ func TestCheckLiveFailureIsReportedAndReturned(t *testing.T) {
 	err := runCheck(context.Background(), &out, localCfg(srv), true)
 	if err == nil || !strings.Contains(out.String(), "out of credits") {
 		t.Fatalf("err=%v\n%s", err, out.String())
+	}
+}
+
+// ---- models that think before they answer ------------------------------------------------
+
+// reasoningOnly mimics what a thinking model does when the token cap is small: it
+// streams only its reasoning (no answer text) and then stops with "length".
+func reasoningOnly(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"The user wants one word, so I should\"}}]}\n\n")
+	fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n")
+}
+
+func TestCheckLiveStillPassesWhenAThinkingModelRunsOutOfTokens(t *testing.T) {
+	srv, hits := checkServer(t, reasoningOnly)
+	var out bytes.Buffer
+	if err := runCheck(context.Background(), &out, localCfg(srv), true); err != nil {
+		t.Fatalf("a reply that reached the length limit proves the connection works; check must not fail: %v\n%s", err, out.String())
+	}
+	s := out.String()
+	for _, want := range []string{"OK. Your key, model and routing work", "256-token", "think before they answer"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("output lacks %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "Failed") {
+		t.Errorf("must not report a failure:\n%s", s)
+	}
+	if hits.Load() != 1 {
+		t.Errorf("want exactly one request, got %d", hits.Load())
+	}
+}
+
+func TestCheckLiveShowsWhatTheModelSaidBeforeTheCap(t *testing.T) {
+	srv, _ := checkServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Okay, so the\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n")
+	})
+	var out bytes.Buffer
+	if err := runCheck(context.Background(), &out, localCfg(srv), true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"Okay, so the"`) {
+		t.Fatalf("expected the partial reply to be shown:\n%s", out.String())
+	}
+}
+
+func TestCheckLiveOtherStoppedRepliesStillFail(t *testing.T) {
+	// Only the length limit is a pass. A blocked or errored reply is a real problem.
+	for _, reason := range []string{"content_filter", "error"} {
+		t.Run(reason, func(t *testing.T) {
+			srv, _ := checkServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":%q}]}\n\ndata: [DONE]\n\n", reason)
+			})
+			var out bytes.Buffer
+			if err := runCheck(context.Background(), &out, localCfg(srv), true); err == nil || !strings.Contains(out.String(), "Failed") {
+				t.Fatalf("finish_reason %q must fail the check; err=%v\n%s", reason, err, out.String())
+			}
+		})
+	}
+}
+
+func TestCheckLiveConnectionDroppedStillFails(t *testing.T) {
+	srv, _ := checkServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n") // then just ends
+	})
+	var out bytes.Buffer
+	if err := runCheck(context.Background(), &out, localCfg(srv), true); err == nil {
+		t.Fatalf("a dropped stream is not a pass:\n%s", out.String())
 	}
 }

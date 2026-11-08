@@ -10,3 +10,7 @@
 
 # Answers saved from the app while testing (Ctrl+S writes into the working dir)
 /cli/*.txt
+
+# Real settings, including your API key. Only example.env is meant to be committed.
+.env
+.env.*

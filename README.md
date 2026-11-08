@@ -145,6 +145,10 @@ nothing is sent anywhere or saved to your computer. You can also force it with
    ```
 
    (You can pass `--model some/model-id` instead of setting `CODIE_MODEL`.)
+
+   Prefer a file? Copy `example.env` to `.env`, fill it in, and load it with
+   `set -a; source .env; set +a`. Codie doesn't read `.env` files itself, so it has
+   to be loaded into your shell first. `.env` is git-ignored.
 4. **Check your setup before asking anything:**
 
    ```sh
@@ -160,12 +164,54 @@ nothing is sent anywhere or saved to your computer. You can also force it with
    codie check --live
    ```
 
-   This sends one tiny request (a few tokens, a fraction of a cent) and tells
+   This sends one tiny request (capped at 256 tokens, a fraction of a cent) and tells
    you whether your key and model work.
 6. Run `codie`. The label should now say `OpenRouter · <your model>`.
 
 If a key is set but the model isn't, Codie tells you what's missing. It won't
 quietly fall back to demo answers that you might mistake for real ones.
+
+### Choosing a model
+
+Codie has no default model, so you pick one, and any chat model on OpenRouter
+works. Whether you need **zero data retention (ZDR)** is up to you. If what you
+send is something you'd rather the provider didn't keep, choose a model that has a
+ZDR endpoint. If you're just experimenting, you don't have to. (Free models are the
+cheapest, but they may keep what you send them, so save those for throwaway
+questions.)
+
+Some models with a zero-data-retention endpoint on OpenRouter, checked 2026-11-08
+(the list changes):
+
+| Model ID | Family | ZDR providers | Rough cost per question |
+| --- | --- | --- | --- |
+| `z-ai/glm-5.3-flash` | GLM | 31 | about $0.0005 |
+| `deepseek/deepseek-v4-flash` | DeepSeek | 10 | about $0.0003 |
+| `anthropic/claude-haiku-5.5` | Haiku | 2 | about $0.0005 |
+
+Also available: `deepseek/deepseek-v4-flash-0731` (19 providers) and
+`anthropic/claude-haiku-4.5` (about 10 times the price of 5.5). "Per question"
+assumes roughly 500 tokens in and 800 out. `example.env` has the same list.
+
+Check the live list for any model yourself (no key needed; it returns every model
+with a ZDR endpoint, so add a pattern to narrow it):
+
+```sh
+curl -s https://openrouter.ai/api/v1/endpoints/zdr \
+  | grep -o '"model_id":"[^"]*"' | cut -d'"' -f4 | sort -u | grep -i glm
+```
+
+If you need ZDR, know what it does and doesn't mean here:
+
+- **Codie doesn't enforce it.** Choosing one of these models doesn't by itself stop
+  OpenRouter from routing you to a provider that keeps data. Turn ZDR on in your
+  OpenRouter privacy settings: https://openrouter.ai/settings/privacy
+- **"Zero retention" has fine print.** OpenRouter's documentation describes
+  "safety retention" endpoints that may keep prompts to detect abuse, says Google
+  Vertex endpoints are not strict ZDR as of October 2026 (Haiku is served by Amazon
+  Bedrock and Google), and says all requests, including ZDR ones, may be screened
+  for illegal content. Read it before relying on this for compliance:
+  https://openrouter.ai/docs/guides/features/zdr
 
 ### What gets sent where
 

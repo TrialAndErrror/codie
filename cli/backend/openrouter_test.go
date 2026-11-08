@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -850,6 +851,144 @@ func TestErrorMessagesFromTheServerHaveControlCharactersStripped(t *testing.T) {
 			msg := last(t, evs).Err.Error()
 			if strings.ContainsAny(msg, "\x1b\x07") {
 				t.Fatalf("escape reached an error message: %q", msg)
+			}
+		})
+	}
+}
+
+// ---- account policy blocks ---------------------------------------------------------
+
+// This is the shape of the 404 OpenRouter returns when a workspace guardrail
+// excludes every endpoint for a model that does exist.
+const guardrailBody = `{"error":{"message":"0 endpoints out of 14 requested are available matching your guardrail restrictions and data policy. We removed them for the following reasons (an endpoint may have matched multiple reasons):\nModel blocked by guardrail: 14 endpoints excluded; configurable at https://openrouter.ai/workspaces/default/guardrails","code":404}}`
+
+func TestGuardrailBlockIsNotReportedAsAMissingModel(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		io.WriteString(w, guardrailBody)
+	})
+	evs := drain(t, client(t, srv).Research(context.Background(), "q"))
+	msg := last(t, evs).Err.Error()
+
+	for _, want := range []string{
+		"guardrails or data-policy settings",                  // says what is actually wrong
+		"test/model",                                          // names the model
+		"Model blocked by guardrail",                          // OpenRouter's own reason is kept
+		"https://openrouter.ai/workspaces/default/guardrails", // the link is not cut off
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message lacks %q:\n%s", want, msg)
+		}
+	}
+	for _, bad := range []string{"couldn't find the model", "Check " + EnvModel} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("message misleads the user with %q:\n%s", bad, msg)
+		}
+	}
+}
+
+func TestDataPolicyBlockIsNotReportedAsAMissingModel(t *testing.T) {
+	// e.g. zero data retention is enforced and the model has no ZDR endpoint.
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		io.WriteString(w, `{"error":{"message":"No endpoints found matching your data policy (Zero data retention). Configure: https://openrouter.ai/settings/privacy"}}`)
+	})
+	msg := last(t, drain(t, client(t, srv).Research(context.Background(), "q"))).Err.Error()
+	if !strings.Contains(msg, "data-policy settings") || !strings.Contains(msg, "https://openrouter.ai/settings/privacy") {
+		t.Fatalf("got: %s", msg)
+	}
+	if strings.Contains(msg, "couldn't find the model") {
+		t.Fatalf("misleading: %s", msg)
+	}
+}
+
+func TestGenuinelyMissingModelStillSaysSo(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		io.WriteString(w, `{"error":{"message":"No endpoints found for nope/not-a-model"}}`)
+	})
+	msg := last(t, drain(t, client(t, srv).Research(context.Background(), "q"))).Err.Error()
+	if !strings.Contains(msg, "couldn't find the model") || !strings.Contains(msg, EnvModel) {
+		t.Fatalf("a real missing model should keep the 'check CODIE_MODEL' advice: %s", msg)
+	}
+}
+
+func TestLongErrorDetailsAreKeptUpToALimit(t *testing.T) {
+	long := strings.Repeat("reason; ", 100) + "THE-LINK-AT-THE-END" // ~800 chars
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"error":{"message":%q}}`, long)
+	})
+	if msg := last(t, drain(t, client(t, srv).Research(context.Background(), "q"))).Err.Error(); !strings.Contains(msg, "THE-LINK-AT-THE-END") {
+		t.Fatalf("detail was cut off too early (%d chars)", len(msg))
+	}
+
+	huge := strings.Repeat("x", 5000)
+	srv2 := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, `{"error":{"message":%q}}`, huge)
+	})
+	if msg := last(t, drain(t, client(t, srv2).Research(context.Background(), "q"))).Err.Error(); len(msg) > 1500 {
+		t.Fatalf("a huge server message must still be bounded, got %d chars", len(msg))
+	}
+}
+
+func TestGuardrailWordingAloneIsRecognised(t *testing.T) {
+	// A message that says "guardrail" but never "data policy", so detection can't
+	// lean on the other keyword.
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		io.WriteString(w, `{"error":{"message":"Model blocked by guardrail: 3 endpoints excluded"}}`)
+	})
+	msg := last(t, drain(t, client(t, srv).Research(context.Background(), "q"))).Err.Error()
+	if !strings.Contains(msg, "guardrails or data-policy settings") || strings.Contains(msg, "couldn't find the model") {
+		t.Fatalf("got: %s", msg)
+	}
+}
+
+// ---- the length limit is a recognisable condition ------------------------------------
+
+func TestLengthLimitIsRecognisableWithErrorsIs(t *testing.T) {
+	cases := map[string]http.HandlerFunc{
+		"streaming": func(w http.ResponseWriter, r *http.Request) {
+			sse(w, delta("part"), finishChunk("length"), "[DONE]")
+		},
+		"reasoning only, no answer text": func(w http.ResponseWriter, r *http.Request) {
+			sse(w, `{"choices":[{"delta":{"reasoning":"thinking…"}}]}`, finishChunk("length"), "[DONE]")
+		},
+		"non-streaming reply": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"choices":[{"message":{"content":"cut"},"finish_reason":"length"}]}`)
+		},
+	}
+	for name, h := range cases {
+		t.Run(name, func(t *testing.T) {
+			evs := drain(t, client(t, serve(t, h)).Research(context.Background(), "q"))
+			l := last(t, evs)
+			if l.Kind != Error || !errors.Is(l.Err, ErrTruncated) {
+				t.Fatalf("want an error that is ErrTruncated, got %+v", l)
+			}
+			if !strings.Contains(l.Err.Error(), "length limit") {
+				t.Fatalf("the message people read should be unchanged: %q", l.Err)
+			}
+		})
+	}
+}
+
+func TestOtherFailuresAreNotMistakenForTheLengthLimit(t *testing.T) {
+	cases := map[string]http.HandlerFunc{
+		"content filter": func(w http.ResponseWriter, r *http.Request) {
+			sse(w, delta("x"), finishChunk("content_filter"), "[DONE]")
+		},
+		"model error":    func(w http.ResponseWriter, r *http.Request) { sse(w, delta("x"), finishChunk("error"), "[DONE]") },
+		"dropped stream": func(w http.ResponseWriter, r *http.Request) { sse(w, delta("x")) },
+		"http 500":       func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) },
+	}
+	for name, h := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := last(t, drain(t, client(t, serve(t, h)).Research(context.Background(), "q")))
+			if l.Kind != Error || errors.Is(l.Err, ErrTruncated) {
+				t.Fatalf("%s must be an error but not ErrTruncated: %+v", name, l)
 			}
 		})
 	}

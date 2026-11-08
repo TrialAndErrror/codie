@@ -33,6 +33,12 @@ type OpenRouter struct {
 
 var errIdle = errors.New("idle timeout")
 
+// ErrTruncated is the error reported when a model stops because it reached its
+// output limit (finish_reason "length"). Callers can test for it with
+// errors.Is: the request itself worked, the reply just ran out of room, which is
+// ordinary for models that spend tokens thinking before they answer.
+var ErrTruncated = errors.New("the answer was cut off because the model hit its length limit")
+
 // NewOpenRouter validates cfg and returns a ready client.
 func NewOpenRouter(cfg Config) (*OpenRouter, error) {
 	if err := cfg.Validate(); err != nil {
@@ -229,7 +235,7 @@ loop:
 func (o *OpenRouter) terminal(finish string, sawDone bool) Event {
 	switch finish {
 	case "length":
-		return Event{Kind: Error, Err: o.errorf("the answer was cut off because the model hit its length limit")}
+		return Event{Kind: Error, Err: ErrTruncated}
 	case "content_filter":
 		return Event{Kind: Error, Err: o.errorf("the model's provider blocked this answer (content filter)")}
 	case "error":
@@ -289,6 +295,10 @@ func (o *OpenRouter) httpError(status int, body []byte) error {
 		what = "OpenRouter says your account is out of credits (402). Add credits at openrouter.ai."
 	case status == http.StatusForbidden:
 		what = "OpenRouter blocked the request (403)."
+	case status == http.StatusNotFound && blockedByPolicy(errorDetail(body)):
+		// The model exists; your own account settings exclude every endpoint for
+		// it. Telling the user to "check the model ID" would send them the wrong way.
+		what = fmt.Sprintf("OpenRouter has the model %q, but your account's guardrails or data-policy settings exclude every endpoint for it (404). Choose a model your settings allow, or change the setting the details below point to.", o.cfg.Model)
 	case status == http.StatusNotFound:
 		what = fmt.Sprintf("OpenRouter couldn't find the model or an endpoint for it (404). Check %s (currently %q).", EnvModel, o.cfg.Model)
 	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
@@ -309,20 +319,28 @@ func (o *OpenRouter) httpError(status int, body []byte) error {
 	return errors.New(o.redact(what))
 }
 
-// errorDetail extracts a short human message from an error body, or "" if the
+// blockedByPolicy reports whether an error detail says the model was excluded by
+// the user's own OpenRouter settings (a workspace guardrail, or a data-policy
+// setting such as zero data retention) rather than not existing.
+func blockedByPolicy(detail string) bool {
+	d := strings.ToLower(detail)
+	return strings.Contains(d, "guardrail") || strings.Contains(d, "data policy")
+}
+
+// errorDetail extracts a human message from an error body, or "" if the
 // body isn't something worth showing (HTML error pages, empty bodies).
 func errorDetail(body []byte) string {
 	var wrapper struct {
 		Error *apiError `json:"error"`
 	}
 	if json.Unmarshal(body, &wrapper) == nil && wrapper.Error != nil && wrapper.Error.Message != "" {
-		return truncate(wrapper.Error.Message, 300)
+		return truncate(wrapper.Error.Message, 1000)
 	}
 	s := strings.TrimSpace(string(body))
 	if s == "" || strings.HasPrefix(s, "<") {
 		return ""
 	}
-	return truncate(strings.Join(strings.Fields(s), " "), 200)
+	return truncate(strings.Join(strings.Fields(s), " "), 500)
 }
 
 func truncate(s string, n int) string {
