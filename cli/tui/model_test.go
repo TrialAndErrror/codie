@@ -1,29 +1,71 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"codie/backend"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// ---- harness ---------------------------------------------------------------
+
+// stubResearcher records what it was asked and hands back a channel the test
+// never writes to: tests inject events with emit() instead, so they control
+// exactly what arrives and when.
+type stubResearcher struct {
+	mu   sync.Mutex
+	qs   []string
+	ctxs []context.Context
+}
+
+func (s *stubResearcher) Research(ctx context.Context, q string) <-chan backend.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.qs = append(s.qs, q)
+	s.ctxs = append(s.ctxs, ctx)
+	return make(chan backend.Event)
+}
+
+func (s *stubResearcher) lastCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ctxs[len(s.ctxs)-1]
+}
+
 type harness struct {
 	t      *testing.T
 	m      tea.Model
 	store  *memStore
+	stub   *stubResearcher
 	copied string
+	copies int
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, store: &memStore{}}
-	m := New(&FakeResearcher{Delay: time.Millisecond}, h.store)
-	m.copyFn = func(s string) error { h.copied = s; return nil }
+	stub := &stubResearcher{}
+	return newHarnessWith(t, stub, stub)
+}
+
+func newHarnessWith(t *testing.T, r backend.Researcher, stub *stubResearcher) *harness {
+	t.Helper()
+	h := &harness{t: t, store: &memStore{}, stub: stub}
+	m := New(r, h.store)
+	m.copyFn = func(s string) error { h.copied = s; h.copies++; return nil }
 	h.m = m
 	h.send(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return h
@@ -38,34 +80,91 @@ func (h *harness) typ(s string)      { h.send(tea.KeyMsg{Type: tea.KeyRunes, Run
 func (h *harness) key(k tea.KeyType) { h.send(tea.KeyMsg{Type: k}) }
 func (h *harness) model() Model      { return h.m.(Model) }
 
-// ask submits a question and delivers the fake backend's answer.
-func (h *harness) ask(q string) {
+// emit delivers a backend event for the current request.
+func (h *harness) emit(ev backend.Event) {
+	h.send(eventMsg{id: h.model().reqID, ev: ev, ok: true})
+}
+func (h *harness) text(s string) { h.emit(backend.Event{Kind: backend.Text, Text: s}) }
+func (h *harness) done()         { h.emit(backend.Event{Kind: backend.Done}) }
+func (h *harness) fail(msg string) {
+	h.emit(backend.Event{Kind: backend.Error, Err: fmt.Errorf("%s", msg)})
+}
+
+// start types a question and presses enter, leaving the request in flight.
+func (h *harness) start(q string) {
+	h.t.Helper()
 	h.typ(q)
 	h.key(tea.KeyEnter)
-	m := h.model()
-	if m.screen != screenAnswer || !m.loading {
+	if m := h.model(); m.screen != screenAnswer || !m.loading {
 		h.t.Fatalf("after enter: screen=%v loading=%v", m.screen, m.loading)
 	}
-	a := snippets[len(snippets)-1].Code // the long one, so the pane scrolls
-	h.send(resultMsg{id: m.reqID, question: q, answer: a})
 }
+
+// tall is a long answer, so the pane has something to scroll.
+var tall = snippets[len(snippets)-1].Code
+
+// ask runs a whole question to completion with the tall answer.
+func (h *harness) ask(q string) {
+	h.t.Helper()
+	h.start(q)
+	h.text(tall)
+	h.done()
+}
+
+// pump drives a real stream into the model: it waits for each event from the
+// model's own channel and feeds it to Update, until the request ends.
+func (h *harness) pump() {
+	h.t.Helper()
+	deadline := time.After(5 * time.Second)
+	for h.model().loading {
+		m := h.model()
+		got := make(chan tea.Msg, 1)
+		go func() { got <- waitEvent(m.reqID, m.events)() }()
+		select {
+		case msg := <-got:
+			h.send(msg)
+		case <-deadline:
+			h.t.Fatal("the stream never finished")
+		}
+	}
+}
+
+// step delivers exactly one event from a real stream.
+func (h *harness) step() {
+	h.t.Helper()
+	m := h.model()
+	got := make(chan tea.Msg, 1)
+	go func() { got <- waitEvent(m.reqID, m.events)() }()
+	select {
+	case msg := <-got:
+		h.send(msg)
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("no event arrived")
+	}
+}
+
+// ---- asking, answering, going back -----------------------------------------
 
 func TestAskFlowAndBackToEmptyBox(t *testing.T) {
 	h := newHarness(t)
 	h.ask("how do I log")
 
 	m := h.model()
-	if m.loading || m.screen != screenAnswer || m.raw == "" {
-		t.Fatalf("answer not shown: %+v", m.screen)
+	if m.loading || m.screen != screenAnswer || m.raw != tall {
+		t.Fatalf("answer not shown: screen=%v loading=%v", m.screen, m.loading)
 	}
-	if len(h.store.entries) != 1 {
-		t.Fatal("answer was not persisted")
+	if len(h.store.entries) != 1 || h.store.entries[0].Question != "how do I log" || h.store.entries[0].Answer != tall {
+		t.Fatalf("answer was not persisted correctly: %+v", h.store.entries)
 	}
 	if m.pane.TotalLineCount() <= m.pane.Height {
 		t.Fatal("expected scrollable content")
 	}
+	if got := h.stub.qs; len(got) != 1 || got[0] != "how do I log" {
+		t.Fatalf("backend was asked %q", got)
+	}
 
-	h.key(tea.KeyDown)
+	h.key(tea.KeyUp)
+	h.key(tea.KeyPgUp)
 	h.key(tea.KeyPgDown)
 	if h.model().pane.YOffset == 0 {
 		t.Fatal("pane did not scroll")
@@ -75,6 +174,31 @@ func TestAskFlowAndBackToEmptyBox(t *testing.T) {
 	m = h.model()
 	if m.screen != screenAsk || m.input.Value() != "" {
 		t.Fatal("esc should return to an empty ask box")
+	}
+}
+
+func TestBlankQuestionIsIgnored(t *testing.T) {
+	h := newHarness(t)
+	h.typ("   ")
+	h.key(tea.KeyEnter)
+	if h.model().screen != screenAsk || len(h.stub.qs) != 0 {
+		t.Fatal("a blank question must not be sent")
+	}
+}
+
+func TestQuestionIsTrimmedBeforeSending(t *testing.T) {
+	h := newHarness(t)
+	h.start("  padded  ")
+	if h.stub.qs[0] != "padded" {
+		t.Fatalf("sent %q", h.stub.qs[0])
+	}
+}
+
+func TestLabelShownOnAskScreen(t *testing.T) {
+	h := newHarness(t)
+	h.m = h.model().WithLabel("OpenRouter · some/model")
+	if v := h.model().View(); !strings.Contains(v, "OpenRouter · some/model") {
+		t.Fatalf("label missing from ask screen:\n%s", v)
 	}
 }
 
@@ -94,6 +218,246 @@ func TestCtrlRJumpsToLastResponse(t *testing.T) {
 		t.Fatalf("want last answer, got screen=%v title=%q", m.screen, m.paneTitle)
 	}
 }
+
+// ---- streaming -------------------------------------------------------------
+
+func TestSpinnerShownBeforeFirstChunk(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	if v := h.model().View(); !strings.Contains(v, "researching…") || !strings.Contains(v, "esc cancel") {
+		t.Fatalf("expected a waiting indicator:\n%s", v)
+	}
+}
+
+func TestStreamingAppendsAndFollowsBottom(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+
+	var want strings.Builder
+	for i := 1; i <= 80; i++ {
+		line := fmt.Sprintf("line %d\n", i)
+		want.WriteString(line)
+		h.text(line)
+		if got := h.model().raw; got != want.String() {
+			t.Fatalf("after chunk %d raw = %q", i, got)
+		}
+	}
+	m := h.model()
+	if !m.loading {
+		t.Fatal("still streaming until Done")
+	}
+	if !m.pane.AtBottom() || m.pane.YOffset == 0 {
+		t.Fatalf("pane should follow the newest text: atBottom=%v offset=%d", m.pane.AtBottom(), m.pane.YOffset)
+	}
+	if !strings.Contains(m.View(), "line 80") {
+		t.Fatal("newest line should be visible")
+	}
+	h.done()
+	if h.model().loading || len(h.store.entries) != 1 {
+		t.Fatal("Done should finish and store the answer")
+	}
+}
+
+func TestScrollingUpStopsFollowing(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	for i := 1; i <= 80; i++ {
+		h.text(fmt.Sprintf("line %d\n", i))
+	}
+	h.key(tea.KeyPgUp)
+	offset := h.model().pane.YOffset
+	if h.model().pane.AtBottom() {
+		t.Fatal("test setup: should have scrolled off the bottom")
+	}
+	h.text("one more line\n")
+	if got := h.model().pane.YOffset; got != offset {
+		t.Fatalf("the view jumped while the user was reading: %d -> %d", offset, got)
+	}
+}
+
+func TestPartialAnswerVisibleWhileStreaming(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.text("first part")
+	v := h.model().View()
+	if !strings.Contains(v, "first part") || !strings.Contains(v, "esc cancel") {
+		t.Fatalf("partial text and cancel hint should both show:\n%s", v)
+	}
+}
+
+func TestActivityShownWhileWorking(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.emit(backend.Event{Kind: backend.Activity, Text: "reading main.go"})
+	if v := h.model().View(); !strings.Contains(v, "reading main.go") {
+		t.Fatalf("activity missing before any text:\n%s", v)
+	}
+	h.text("code")
+	if v := h.model().View(); !strings.Contains(v, "reading main.go") {
+		t.Fatalf("activity should stay in the footer while streaming:\n%s", v)
+	}
+	h.done()
+	if v := h.model().View(); strings.Contains(v, "reading main.go") {
+		t.Fatalf("activity should clear when finished:\n%s", v)
+	}
+}
+
+func TestCopyAndSaveAreBlockedWhileStreaming(t *testing.T) {
+	t.Chdir(t.TempDir())
+	h := newHarness(t)
+	h.start("q")
+	h.text("partial")
+
+	h.key(tea.KeyCtrlC)
+	if h.copies != 0 || !strings.Contains(h.model().status, "still answering") {
+		t.Fatalf("copy must wait: copies=%d status=%q", h.copies, h.model().status)
+	}
+	if h.model().screen != screenAnswer {
+		t.Fatal("ctrl+c on the pane must never quit")
+	}
+	h.key(tea.KeyCtrlS)
+	if h.model().saving || !strings.Contains(h.model().status, "still answering") {
+		t.Fatalf("save must wait: saving=%v status=%q", h.model().saving, h.model().status)
+	}
+	if entries, _ := os.ReadDir("."); len(entries) != 0 {
+		t.Fatal("nothing should have been written")
+	}
+}
+
+func TestEventsAfterDoneAreIgnored(t *testing.T) {
+	h := newHarness(t)
+	h.ask("q")
+	before := h.model().raw
+	h.text("late text")
+	h.done()
+	h.fail("late error")
+	m := h.model()
+	if m.raw != before || m.paneErr != "" || len(h.store.entries) != 1 {
+		t.Fatalf("events after Done must be ignored: raw changed=%v err=%q stored=%d", m.raw != before, m.paneErr, len(h.store.entries))
+	}
+}
+
+// ---- failures ----------------------------------------------------------------
+
+func TestErrorBeforeAnyTextIsShownNotStored(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.fail("OpenRouter rejected your API key (401)")
+	m := h.model()
+	if m.loading || m.paneErr == "" || len(h.store.entries) != 0 {
+		t.Fatalf("loading=%v err=%q stored=%d", m.loading, m.paneErr, len(h.store.entries))
+	}
+	if v := m.View(); !strings.Contains(v, "rejected your API key") {
+		t.Fatalf("error not shown:\n%s", v)
+	}
+}
+
+func TestMidStreamErrorKeepsPartialAndDoesNotStore(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.text("func half() {\n")
+	h.fail("connection lost")
+
+	m := h.model()
+	v := m.View()
+	if !strings.Contains(v, "func half()") || !strings.Contains(v, "connection lost") {
+		t.Fatalf("partial answer and error should both be visible:\n%s", v)
+	}
+	if len(h.store.entries) != 0 {
+		t.Fatal("an incomplete answer must not enter history")
+	}
+	h.key(tea.KeyCtrlC)
+	if h.copies != 0 || !strings.Contains(h.model().status, "incomplete") {
+		t.Fatalf("an incomplete answer must not be copied: status=%q", h.model().status)
+	}
+	h.key(tea.KeyCtrlS)
+	if h.model().saving {
+		t.Fatal("an incomplete answer must not be saved")
+	}
+}
+
+func TestEmptyAnswerIsAnError(t *testing.T) {
+	for name, body := range map[string]string{"nothing": "", "whitespace": " \n\t "} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			h.start("q")
+			if body != "" {
+				h.text(body)
+			}
+			h.done()
+			if h.model().paneErr == "" || len(h.store.entries) != 0 {
+				t.Fatalf("empty answers are failures: err=%q stored=%d", h.model().paneErr, len(h.store.entries))
+			}
+		})
+	}
+}
+
+func TestStreamClosedWithoutResultIsAnError(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.text("partial")
+	h.send(eventMsg{id: h.model().reqID, ok: false})
+	m := h.model()
+	if m.loading || !strings.Contains(m.paneErr, "connection closed") || len(h.store.entries) != 0 {
+		t.Fatalf("loading=%v err=%q stored=%d", m.loading, m.paneErr, len(h.store.entries))
+	}
+}
+
+// ---- cancelling --------------------------------------------------------------
+
+func TestEscDuringStreamCancelsTheRequest(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.text("partial")
+	ctx := h.stub.lastCtx()
+	if ctx.Err() != nil {
+		t.Fatal("test setup: request should still be live")
+	}
+
+	h.key(tea.KeyEsc)
+	if ctx.Err() == nil {
+		t.Fatal("esc must cancel the request's context so the HTTP call is dropped")
+	}
+	m := h.model()
+	if m.screen != screenAsk || m.loading {
+		t.Fatalf("esc should return to the ask screen: screen=%v loading=%v", m.screen, m.loading)
+	}
+
+	h.send(eventMsg{id: m.reqID - 1, ev: backend.Event{Kind: backend.Text, Text: "late"}, ok: true})
+	h.send(eventMsg{id: m.reqID - 1, ev: backend.Event{Kind: backend.Done}, ok: true})
+	if len(h.store.entries) != 0 || h.model().screen != screenAsk {
+		t.Fatal("events from a cancelled request must be ignored")
+	}
+}
+
+func TestNewQuestionAfterCancelIgnoresOldEvents(t *testing.T) {
+	h := newHarness(t)
+	h.start("first")
+	oldID := h.model().reqID
+	h.key(tea.KeyEsc)
+	h.start("second")
+
+	h.send(eventMsg{id: oldID, ev: backend.Event{Kind: backend.Text, Text: "STALE"}, ok: true})
+	h.text("fresh answer")
+	h.done()
+	m := h.model()
+	if strings.Contains(m.raw, "STALE") || m.raw != "fresh answer" {
+		t.Fatalf("old request leaked into the new answer: %q", m.raw)
+	}
+	if len(h.store.entries) != 1 || h.store.entries[0].Question != "second" {
+		t.Fatalf("stored: %+v", h.store.entries)
+	}
+}
+
+func TestSpinnerStopsWhenFinished(t *testing.T) {
+	h := newHarness(t)
+	h.ask("q")
+	if cmd := h.send(h.model().spin.Tick()); cmd != nil {
+		t.Fatal("spinner should stop ticking once the answer is complete")
+	}
+}
+
+// ---- history -----------------------------------------------------------------
 
 func TestHistoryListAndDetail(t *testing.T) {
 	h := newHarness(t)
@@ -150,93 +514,6 @@ func TestHistorySearch(t *testing.T) {
 	}
 }
 
-func TestCopyWholePane(t *testing.T) {
-	h := newHarness(t)
-	h.ask("copy me")
-	h.send(tea.KeyMsg{Type: tea.KeyCtrlC})
-	if h.copied != h.model().raw || h.copied == "" {
-		t.Fatal("ctrl+c should copy the raw, unwrapped answer")
-	}
-	if h.model().screen != screenAnswer {
-		t.Fatal("ctrl+c on the pane must copy, not quit")
-	}
-}
-
-func TestSaveToFile(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-	h := newHarness(t)
-	h.ask("save me")
-
-	h.key(tea.KeyCtrlS)
-	if !h.model().saving || h.model().saveInput.Value() != "save-me.txt" {
-		t.Fatalf("expected filename prompt prefilled, got %q", h.model().saveInput.Value())
-	}
-	h.key(tea.KeyEnter)
-	b, err := os.ReadFile(filepath.Join(dir, "save-me.txt"))
-	if err != nil || string(b) != h.model().raw {
-		t.Fatalf("file not written correctly: %v", err)
-	}
-
-	// Saving again must not clobber the existing file.
-	h.key(tea.KeyCtrlS)
-	h.key(tea.KeyEnter)
-	if !strings.Contains(h.model().status, "already exists") {
-		t.Fatalf("expected overwrite refusal, status=%q", h.model().status)
-	}
-
-	h.key(tea.KeyCtrlS)
-	h.key(tea.KeyEsc)
-	if h.model().saving {
-		t.Fatal("esc should cancel the save prompt")
-	}
-}
-
-func TestCancelIgnoresStaleResult(t *testing.T) {
-	h := newHarness(t)
-	h.typ("slow")
-	h.key(tea.KeyEnter)
-	id := h.model().reqID
-	h.key(tea.KeyEsc) // cancel while loading
-	if h.model().screen != screenAsk || h.model().loading {
-		t.Fatal("esc should cancel and return to ask")
-	}
-	h.send(resultMsg{id: id, question: "slow", answer: "late"})
-	if len(h.store.entries) != 0 || h.model().screen != screenAsk {
-		t.Fatal("stale result must be ignored")
-	}
-}
-
-func TestErrorIsShownNotStored(t *testing.T) {
-	h := newHarness(t)
-	h.typ("fail")
-	h.key(tea.KeyEnter)
-	_, err := (&FakeResearcher{}).Research(nil2(), "fail")
-	h.send(resultMsg{id: h.model().reqID, question: "fail", err: err})
-	if h.model().paneErr == "" || len(h.store.entries) != 0 {
-		t.Fatal("errors should show in the pane and not enter history")
-	}
-}
-
-func TestJSONStoreRoundTrip(t *testing.T) {
-	s := JSONStore{Path: filepath.Join(t.TempDir(), "sub", "history.json")}
-	if got, err := s.Load(); err != nil || got != nil {
-		t.Fatalf("missing file should load empty: %v %v", got, err)
-	}
-	at := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
-	for _, q := range []string{"a", "b"} {
-		if err := s.Append(Entry{Question: q, Answer: q + "!", At: at}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := s.Load()
-	if err != nil || len(got) != 2 || got[1].Answer != "b!" || !got[0].At.Equal(at) {
-		t.Fatalf("round trip failed: %+v %v", got, err)
-	}
-}
-
-func nil2() context.Context { return context.Background() }
-
 // deliver runs a returned command and feeds list-filter results back into the
 // model. The list computes search matches asynchronously via a tea.Cmd. Other
 // commands (cursor blink, spinner ticks) sleep, so they run with a short timeout
@@ -262,12 +539,58 @@ func (h *harness) deliver(cmd tea.Cmd) {
 	}
 }
 
+// ---- copy and save -------------------------------------------------------------
+
+func TestCopyWholePaneOnceFinished(t *testing.T) {
+	h := newHarness(t)
+	h.ask("copy me")
+	h.key(tea.KeyCtrlC)
+	if h.copied != tall || h.copies != 1 {
+		t.Fatal("ctrl+c should copy the raw, unwrapped answer")
+	}
+	if h.model().screen != screenAnswer {
+		t.Fatal("ctrl+c on the pane must copy, not quit")
+	}
+}
+
+func TestSaveToFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	h := newHarness(t)
+	h.ask("save me")
+
+	h.key(tea.KeyCtrlS)
+	if !h.model().saving || h.model().saveInput.Value() != "save-me.txt" {
+		t.Fatalf("expected filename prompt prefilled, got %q", h.model().saveInput.Value())
+	}
+	h.key(tea.KeyEnter)
+	b, err := os.ReadFile(filepath.Join(dir, "save-me.txt"))
+	if err != nil || string(b) != tall {
+		t.Fatalf("file not written correctly: %v", err)
+	}
+
+	// Saving again must not clobber the existing file.
+	h.key(tea.KeyCtrlS)
+	h.key(tea.KeyEnter)
+	if !strings.Contains(h.model().status, "already exists") {
+		t.Fatalf("expected overwrite refusal, status=%q", h.model().status)
+	}
+
+	h.key(tea.KeyCtrlS)
+	h.key(tea.KeyEsc)
+	if h.model().saving {
+		t.Fatal("esc should cancel the save prompt")
+	}
+}
+
+// ---- the fake backend ------------------------------------------------------------
+
 func TestFakeResearcherCyclesAndWraps(t *testing.T) {
 	r := &FakeResearcher{}
 	seen := map[string]bool{}
 	var first, afterWrap string
 	for i := 0; i <= len(snippets); i++ {
-		a, err := r.Research(context.Background(), "q")
+		a, err := backend.Collect(r.Research(context.Background(), "q"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -285,11 +608,83 @@ func TestFakeResearcherCyclesAndWraps(t *testing.T) {
 	if first != afterWrap {
 		t.Fatal("cycle should wrap back to the first snippet")
 	}
-	// "fail" errors without consuming a snippet.
-	if _, err := r.Research(context.Background(), "please fail"); err == nil {
-		t.Fatal("expected error")
+}
+
+func TestFakeResearcherStreamsInChunksAndReassembles(t *testing.T) {
+	r := &FakeResearcher{}
+	var chunks int
+	var b strings.Builder
+	for ev := range r.Research(context.Background(), "q") {
+		if ev.Kind == backend.Text {
+			chunks++
+			b.WriteString(ev.Text)
+		}
+	}
+	if chunks < 5 {
+		t.Fatalf("expected a multi-chunk stream, got %d chunk(s)", chunks)
+	}
+	if b.String() != snippets[0].Code {
+		t.Fatal("chunks must reassemble to the original snippet exactly")
 	}
 }
+
+func TestFakeResearcherFailureModes(t *testing.T) {
+	r := &FakeResearcher{}
+
+	evs := collectEvents(r.Research(context.Background(), "please fail"))
+	if len(evs) != 1 || evs[0].Kind != backend.Error {
+		t.Fatalf("'fail' should error before any text: %+v", evs)
+	}
+
+	evs = collectEvents(r.Research(context.Background(), "midfail"))
+	if len(evs) < 2 || evs[len(evs)-1].Kind != backend.Error || evs[0].Kind != backend.Text {
+		t.Fatalf("'midfail' should stream some text then error: %d events", len(evs))
+	}
+
+	// Neither failure consumed a snippet.
+	got, _ := backend.Collect(r.Research(context.Background(), "ok"))
+	if got != snippets[0].Code {
+		t.Fatal("failed requests must not advance the cycle")
+	}
+}
+
+func collectEvents(ch <-chan backend.Event) []backend.Event {
+	var evs []backend.Event
+	for ev := range ch {
+		evs = append(evs, ev)
+	}
+	return evs
+}
+
+func TestFakeResearcherCancelClosesTheChannel(t *testing.T) {
+	r := &FakeResearcher{Delay: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := r.Research(ctx, "q")
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected the channel to close without sending")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel did not stop the fake backend")
+	}
+}
+
+func TestFakeResearcherCancelWhileNobodyReads(t *testing.T) {
+	r := &FakeResearcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := r.Research(ctx, "q") // goroutine blocks on its first send
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-ch: // closed (or one buffered-looking value): either way it must unblock
+	case <-time.After(2 * time.Second):
+		t.Fatal("producer stayed blocked after cancel")
+	}
+}
+
+// ---- demo history ------------------------------------------------------------------
 
 func TestDemoEntries(t *testing.T) {
 	now := time.Now()
@@ -310,7 +705,7 @@ func TestDemoEntries(t *testing.T) {
 func TestDemoHistoryShowsInUI(t *testing.T) {
 	h := newHarness(t)
 	h.store.entries = DemoEntries(time.Now())
-	m := New(&FakeResearcher{}, h.store)
+	m := New(h.stub, h.store)
 	h.m = m
 	h.send(tea.WindowSizeMsg{Width: 100, Height: 30})
 	h.key(tea.KeyCtrlH)
@@ -321,5 +716,211 @@ func TestDemoHistoryShowsInUI(t *testing.T) {
 	h.key(tea.KeyCtrlR) // last response comes from seeded history
 	if h.model().screen != screenAnswer {
 		t.Fatal("ctrl+r should open the newest seeded entry")
+	}
+}
+
+func TestJSONStoreRoundTrip(t *testing.T) {
+	s := JSONStore{Path: filepath.Join(t.TempDir(), "sub", "history.json")}
+	if got, err := s.Load(); err != nil || got != nil {
+		t.Fatalf("missing file should load empty: %v %v", got, err)
+	}
+	at := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	for _, q := range []string{"a", "b"} {
+		if err := s.Append(Entry{Question: q, Answer: q + "!", At: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Load()
+	if err != nil || len(got) != 2 || got[1].Answer != "b!" || !got[0].At.Equal(at) {
+		t.Fatalf("round trip failed: %+v %v", got, err)
+	}
+}
+
+// ---- end to end: real OpenRouter client -> real model, fake server --------------------
+//
+// These wire the actual backend.OpenRouter client into the actual UI model and
+// point it at a local server that speaks OpenRouter's protocol. They prove the
+// pieces fit together, with no network and no real key.
+
+const e2eKey = "sk-or-test-SECRET-KEY-1234"
+
+func e2eServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body) // as a real server does; lets net/http detect disconnects
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		h(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func e2eHarness(t *testing.T, srv *httptest.Server) *harness {
+	t.Helper()
+	o, err := backend.NewOpenRouter(backend.Config{APIKey: e2eKey, Model: "test/model", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newHarnessWith(t, o, nil)
+}
+
+func e2eSSE(w http.ResponseWriter, payloads ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, p := range payloads {
+		fmt.Fprintf(w, "data: %s\n\n", p)
+	}
+	w.(http.Flusher).Flush()
+}
+
+func e2eDelta(s string) string {
+	b, _ := json.Marshal(s)
+	return fmt.Sprintf(`{"choices":[{"delta":{"content":%s}}]}`, b)
+}
+
+const e2eStop = `{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`
+
+func TestEndToEndStreamIntoPane(t *testing.T) {
+	var asked string
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct{ Role, Content string } `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		asked = req.Messages[len(req.Messages)-1].Content
+		w.Header().Set("Content-Type", "text/event-stream")
+		f := w.(http.Flusher)
+		for _, p := range []string{e2eDelta("```go\n"), e2eDelta("fmt.Println(\"hi\")\n"), e2eDelta("```"), e2eStop, "[DONE]"} {
+			fmt.Fprintf(w, "data: %s\n\n", p)
+			f.Flush()
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	h := e2eHarness(t, srv)
+	h.start("  say hi in go  ")
+
+	h.step() // first chunk only
+	if got := h.model().raw; got != "```go\n" || !h.model().loading {
+		t.Fatalf("first chunk should appear while still streaming: raw=%q loading=%v", got, h.model().loading)
+	}
+
+	h.pump()
+	m := h.model()
+	want := "```go\nfmt.Println(\"hi\")\n```"
+	if m.raw != want || m.loading || m.paneErr != "" {
+		t.Fatalf("raw=%q loading=%v err=%q", m.raw, m.loading, m.paneErr)
+	}
+	if asked != "say hi in go" {
+		t.Fatalf("server received question %q", asked)
+	}
+	if len(h.store.entries) != 1 || h.store.entries[0].Answer != want || h.store.entries[0].Question != "say hi in go" {
+		t.Fatalf("history: %+v", h.store.entries)
+	}
+	if !strings.Contains(m.View(), "fmt.Println") {
+		t.Fatal("answer not rendered")
+	}
+	h.key(tea.KeyCtrlC)
+	if h.copied != want {
+		t.Fatalf("copied %q", h.copied)
+	}
+}
+
+func TestEndToEndBadKeyShowsAClearErrorAndNeverTheKey(t *testing.T) {
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, `{"error":{"message":"invalid key %s"}}`, e2eKey)
+	})
+	h := e2eHarness(t, srv)
+	h.start("q")
+	h.pump()
+
+	m := h.model()
+	view := m.View()
+	if !strings.Contains(view, "rejected your API key") || !strings.Contains(view, "OPENROUTER_API_KEY") {
+		t.Fatalf("error should say what to do:\n%s", view)
+	}
+	if strings.Contains(view, e2eKey) || strings.Contains(m.paneErr, e2eKey) || strings.Contains(m.status, e2eKey) {
+		t.Fatal("the API key leaked into the UI")
+	}
+	if len(h.store.entries) != 0 {
+		t.Fatal("a failed request must not be stored")
+	}
+}
+
+func TestEndToEndMidStreamFailure(t *testing.T) {
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		e2eSSE(w, e2eDelta("func half() {\n"), `{"error":{"code":502,"message":"provider fell over"}}`)
+	})
+	h := e2eHarness(t, srv)
+	h.start("q")
+	h.pump()
+
+	m := h.model()
+	v := m.View()
+	if !strings.Contains(v, "func half()") || !strings.Contains(v, "provider fell over") {
+		t.Fatalf("partial answer and reason should show:\n%s", v)
+	}
+	if len(h.store.entries) != 0 {
+		t.Fatal("a broken answer must not be stored")
+	}
+}
+
+func TestEndToEndTruncatedAnswerIsNotStored(t *testing.T) {
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		e2eSSE(w, e2eDelta("func cut"), `{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}`, "[DONE]")
+	})
+	h := e2eHarness(t, srv)
+	h.start("q")
+	h.pump()
+	if !strings.Contains(h.model().paneErr, "length limit") || len(h.store.entries) != 0 {
+		t.Fatalf("err=%q stored=%d", h.model().paneErr, len(h.store.entries))
+	}
+}
+
+func TestEndToEndEscDropsTheHTTPConnection(t *testing.T) {
+	disconnected := make(chan struct{})
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		e2eSSE(w, e2eDelta("starting…"))
+		<-r.Context().Done()
+		close(disconnected)
+	})
+	h := e2eHarness(t, srv)
+	h.start("q")
+	h.step()
+	if h.model().raw != "starting…" {
+		t.Fatalf("raw=%q", h.model().raw)
+	}
+
+	h.key(tea.KeyEsc)
+	select {
+	case <-disconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("esc did not drop the connection to OpenRouter (it would keep generating and billing)")
+	}
+	if h.model().screen != screenAsk || len(h.store.entries) != 0 {
+		t.Fatal("cancel should return to the ask screen and store nothing")
+	}
+}
+
+func TestEndToEndSecondQuestionAfterFailureWorks(t *testing.T) {
+	var calls int
+	srv := e2eServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		e2eSSE(w, e2eDelta("fine now"), e2eStop, "[DONE]")
+	})
+	h := e2eHarness(t, srv)
+	h.start("one")
+	h.pump()
+	if !strings.Contains(h.model().paneErr, "rate limiting") {
+		t.Fatalf("err=%q", h.model().paneErr)
+	}
+	h.key(tea.KeyEsc)
+	h.start("two")
+	h.pump()
+	if h.model().raw != "fine now" || h.model().paneErr != "" || len(h.store.entries) != 1 {
+		t.Fatalf("recovery failed: raw=%q err=%q stored=%d", h.model().raw, h.model().paneErr, len(h.store.entries))
 	}
 }
