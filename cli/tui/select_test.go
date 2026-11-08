@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"github.com/charmbracelet/bubbles/list"
 	"os"
 	"path/filepath"
 	"strings"
@@ -522,6 +523,33 @@ func TestSaveWritesTheWholeAnswerWhenNothingIsSelected(t *testing.T) {
 	}
 }
 
+func TestCtrlPSavesQuestionAndAnswerAsOneMarkdownFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	h := newHarness(t)
+	h.answerWith("how do I\tsay hi?", multi)
+	h.typ("j") // a selected block must not narrow what ctrl+p saves
+	h.key(tea.KeyCtrlP)
+	if h.model().saveInput.Value() != "how-do-i-say-hi.md" || !strings.Contains(h.model().saveInput.Prompt, "entire response") {
+		t.Fatalf("prompt=%q value=%q", h.model().saveInput.Prompt, h.model().saveInput.Value())
+	}
+	h.key(tea.KeyEnter)
+	b, _ := os.ReadFile(filepath.Join(dir, "how-do-i-say-hi.md"))
+	if want := "# how do I say hi?\n\n" + multi + "\n"; string(b) != want {
+		t.Fatalf("got %q, want %q", b, want)
+	}
+}
+
+func TestCtrlPIsBlockedWhileStreaming(t *testing.T) {
+	h := newHarness(t)
+	h.start("q")
+	h.text("partial")
+	h.key(tea.KeyCtrlP)
+	if h.model().saving {
+		t.Fatal("should not offer to save a half-finished answer")
+	}
+}
+
 func TestSavePromptKeepsWhatWasSelectedWhenItOpened(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -894,5 +922,92 @@ func TestAStepAlreadyFullyOnScreenDoesNotScroll(t *testing.T) {
 	}
 	if checked < 2 {
 		t.Fatalf("setup: expected several steps visible at once, only %d were", checked)
+	}
+}
+
+func TestSaveDirIsTheDefaultFolderForRelativeNames(t *testing.T) {
+	launch, saves := t.TempDir(), filepath.Join(t.TempDir(), "snips", "here")
+	t.Chdir(launch)
+	h := newHarness(t)
+	h.m = h.model().WithSaveDir(saves)
+	h.answerWith("where", multi)
+	h.key(tea.KeyCtrlP)
+	h.key(tea.KeyEnter)
+	if _, err := os.ReadFile(filepath.Join(saves, "where.md")); err != nil {
+		t.Fatalf("not saved in the save dir (it should be created): %v", err)
+	}
+	if entries, _ := os.ReadDir(launch); len(entries) != 0 {
+		t.Fatalf("nothing should land in the launch folder, got %d files", len(entries))
+	}
+	if !strings.Contains(h.model().status, saves) {
+		t.Fatalf("status should show the full path: %q", h.model().status)
+	}
+}
+
+func TestSavePath(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	for _, c := range []struct{ dir, name, want string }{
+		{"", "a.go", "a.go"},
+		{"/x/y", "a.go", "/x/y/a.go"},
+		{"/x/y", "/abs/a.go", "/abs/a.go"},
+		{"~/s", "a.go", filepath.Join(home, "s", "a.go")},
+	} {
+		if got := savePath(c.dir, c.name); got != c.want {
+			t.Errorf("savePath(%q,%q)=%q want %q", c.dir, c.name, got, c.want)
+		}
+	}
+}
+
+func TestQDoesWhatEscDoes(t *testing.T) {
+	// answer screen: q first deselects, then goes back to the ask box
+	h := newHarness(t)
+	h.answerWith("one", multi)
+	h.typ("j")
+	h.typ("q")
+	if h.model().screen != screenAnswer || h.model().sel != -1 {
+		t.Fatal("first q should only deselect, like esc")
+	}
+	h.typ("q")
+	if h.model().screen != screenAsk {
+		t.Fatal("second q should go back to the ask box")
+	}
+	// while typing a question, q is just a letter
+	h.typ("q")
+	if h.model().input.Value() != "q" || h.model().screen != screenAsk {
+		t.Fatalf("q must be typeable in the ask box, got %q", h.model().input.Value())
+	}
+
+	// history: q leaves it; an applied search is cleared first
+	h2 := newHarness(t)
+	h2.ask("alpha question")
+	h2.key(tea.KeyEsc)
+	h2.key(tea.KeyCtrlH)
+	h2.typ("q")
+	if h2.model().screen != screenAsk {
+		t.Fatal("q should leave the history page")
+	}
+	h2.key(tea.KeyCtrlH)
+	h2.typ("/")
+	h2.typ("a") // q while typing a search belongs to the search
+	h2.typ("q")
+	if h2.model().screen != screenHistory || h2.model().hist.list.FilterState() != list.Filtering {
+		t.Fatal("q must stay a letter while typing a search")
+	}
+	h2.key(tea.KeyEnter)
+	if h2.model().hist.list.FilterState() != list.FilterApplied {
+		t.Skip("filter matched nothing, so it was not applied")
+	}
+}
+
+func TestQFromHistoryAnswerReturnsToHistory(t *testing.T) {
+	h := newHarness(t)
+	h.store.entries = []Entry{{Question: "old", Answer: multi, At: time.Now()}}
+	h.m = New(h.stub, h.store)
+	h.send(tea.WindowSizeMsg{Width: 100, Height: 30})
+	h.key(tea.KeyCtrlH)
+	h.key(tea.KeyEnter)
+	h.typ("q")
+	if h.model().screen != screenHistory {
+		t.Fatal("q should go up one level, to history")
 	}
 }

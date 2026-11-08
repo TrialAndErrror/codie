@@ -79,7 +79,8 @@ type Model struct {
 	sel         int        // index into blocks of the highlighted one, or -1 for none
 	cancel      context.CancelFunc
 	reqID       int
-	fromHistory bool // esc returns to history instead of the ask screen
+	fromHistory bool   // esc returns to history instead of the ask screen
+	saveDir     string // default folder for saves ("" = the folder Codie was launched from)
 	saving      bool
 	saveInput   textinput.Model
 	saveText    string // exactly what the save prompt will write
@@ -130,6 +131,13 @@ func New(r backend.Researcher, s Store) Model {
 // always knows whether answers are real or samples.
 func (m Model) WithLabel(label string) Model {
 	m.label = label
+	return m
+}
+
+// WithSaveDir sets the folder saves go in when the typed name is a relative one.
+// A leading ~ means the home folder. Empty keeps the launch folder.
+func (m Model) WithSaveDir(dir string) Model {
+	m.saveDir = dir
 	return m
 }
 
@@ -260,7 +268,7 @@ func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "esc":
+	case "esc", "q": // q is a second way to go up one level
 		if m.sel >= 0 { // first esc leaves block selection and shows the whole answer again
 			m.sel = -1
 			m.renderPane()
@@ -297,6 +305,8 @@ func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+s":
 		return m.startSave()
+	case "ctrl+p":
+		return m.startSaveMarkdown()
 
 	case "g":
 		m.pane.GotoTop()
@@ -436,6 +446,29 @@ func (m Model) startSave() (tea.Model, tea.Cmd) {
 	return m, textinput.Blink
 }
 
+// startSaveMarkdown opens the filename prompt to save the whole exchange, the
+// question as a heading followed by the answer, as one Markdown file. The answer
+// is already Markdown (its code blocks are fenced), so it is written as-is.
+func (m Model) startSaveMarkdown() (tea.Model, tea.Cmd) {
+	if why := m.exportBlocked("save"); why != "" {
+		m.status = why
+		return m, nil
+	}
+	m.saveText, m.saveWhat = markdownDoc(m.paneTitle, m.raw), "entire response"
+	m.saving = true
+	m.saveInput.Prompt = "Save " + m.saveWhat + " as: "
+	m.saveInput.SetValue(slug(m.paneTitle) + ".md")
+	m.saveInput.CursorEnd()
+	m.saveInput.Focus()
+	return m, textinput.Blink
+}
+
+// markdownDoc formats a question and its answer as a Markdown document.
+func markdownDoc(question, answer string) string {
+	q := strings.Join(strings.Fields(question), " ") // a heading is one line
+	return "# " + q + "\n\n" + strings.TrimRight(answer, "\n") + "\n"
+}
+
 func (m Model) updateSaving(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -446,10 +479,11 @@ func (m Model) updateSaving(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if name == "" {
 			return m, nil
 		}
-		if err := saveFile(name, m.saveText); err != nil {
+		path := savePath(m.saveDir, name)
+		if err := saveFile(path, m.saveText); err != nil {
 			m.status = errorStyle.Render("save failed: " + err.Error())
 		} else {
-			m.status = "saved " + m.saveWhat + " to " + name
+			m.status = "saved " + m.saveWhat + " to " + path
 		}
 		m.saving = false
 		return m, nil
@@ -728,17 +762,17 @@ func (m Model) answerHelp() string {
 	pct := m.pane.ScrollPercent() * 100
 	switch {
 	case m.sel >= 0:
-		return m.blockLabel() + " • j/k move • c copy • C plain • ctrl+s save • esc deselect"
+		return m.blockLabel() + " • j/k • c copy • C plain • ctrl+s save • ctrl+p print • esc/q up"
 	case m.canSelect():
 		plural := "s"
 		if len(m.blocks) == 1 {
 			plural = ""
 		}
-		return fmt.Sprintf("%d code block%s • j/k select • pgup/pgdn scroll • ctrl+s save • esc back • %3.0f%%", len(m.blocks), plural, pct)
+		return fmt.Sprintf("%d code block%s • j/k select • pgup/pgdn scroll • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", len(m.blocks), plural, pct)
 	case m.paneErr != "":
-		return fmt.Sprintf("↑/↓ scroll • esc back • %3.0f%%", pct)
+		return fmt.Sprintf("↑/↓ scroll • esc/q back • %3.0f%%", pct)
 	}
-	return fmt.Sprintf("↑/↓ scroll • ctrl+s save • esc back • %3.0f%%", pct)
+	return fmt.Sprintf("↑/↓ scroll • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", pct)
 }
 
 // progressText is what we say while waiting: the backend's latest activity if

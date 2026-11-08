@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"os"
+	"strings"
 	"time"
 
 	"codie/backend"
@@ -44,7 +45,7 @@ will do before you ask anything.`,
 		if err != nil {
 			return err
 		}
-		m := tui.New(rt.Researcher, rt.Store).WithLabel(rt.Label)
+		m := tui.New(rt.Researcher, rt.Store).WithLabel(rt.Label).WithSaveDir(strings.TrimSpace(os.Getenv(tui.EnvSaveDir)))
 		_, err = tea.NewProgram(m, tea.WithAltScreen()).Run()
 		return err
 	},

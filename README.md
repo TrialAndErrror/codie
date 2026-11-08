@@ -54,7 +54,7 @@ When you start Codie, you get an empty text box. Type your question and press
 ### 2. Answer
 
 Your answer appears in a full-screen pane. While Codie is working you'll see a
-spinner; press **Esc** to cancel and go back if you change your mind.
+spinner; press **Esc** (or **q**) to cancel and go back if you change your mind.
 
 Answers appear as they're written, and the view follows the newest text. Scroll
 up to stop it following while you read. Nothing can be copied or saved until the
@@ -81,10 +81,11 @@ beside a thin bar. To work through it:
 | **c** | Copy the selected block, wrapped in Begin / End markers |
 | **C** | Copy the selected block as plain code, with no markers |
 | **Ctrl+S** | Save the selected block, or the whole answer if none is selected |
+| **Ctrl+P** | Print the entire response: your question and the whole answer, saved together as one Markdown (`.md`) file |
 | **PgUp / PgDn** (or **b / f**) | Scroll a page, even with a block selected |
 | **u / d** | Scroll half a page |
 | **g / G** | Jump to the top / bottom |
-| **Esc** | Clear the selection; press again to go back |
+| **Esc** or **q** | Clear the selection; press again to go back |
 | **Ctrl+C** | Quit |
 
 If an answer has no code blocks (or while it's still arriving), **↑ / ↓** and
@@ -124,6 +125,16 @@ With nothing selected it saves the whole answer as a `.txt` file. Edit the name 
 you like and press **Enter**. The file goes in the folder you launched Codie
 from. Codie will never overwrite an existing file; if the name is taken you'll
 see a message and can try again with a different name. Press **Esc** to cancel.
+
+**Ctrl+P** ("print entire response") works the same way but saves the whole exchange: your question as a
+heading, then the full answer, as a single Markdown file you can open anywhere.
+It always saves everything, even if a code block is selected.
+
+**Where saves go.** By default, in the folder you launched Codie from. To pick a
+different default, set `CODIE_SAVE_DIR` (for example `CODIE_SAVE_DIR=~/codie-snippets`
+in your `.env`). Codie creates the folder if needed, and a leading `~` means your
+home folder. This applies to **Ctrl+S** and **Ctrl+P** whenever you type a plain
+filename; a full path such as `/tmp/x.go` always goes exactly where you typed it.
 Saved files never include the copy markers.
 
 If a request fails partway, you'll see what arrived plus the reason, but its code
@@ -140,7 +151,7 @@ newest first, each with the date and time you asked it.
 | **↑ / ↓** | Move through the list |
 | **/** | Search your questions by word |
 | **Enter** | Open the answer exactly as it was generated at the time |
-| **Esc** | Go back (when a search is active, the first Esc clears it) |
+| **Esc** or **q** | Go back (when a search is active, the first Esc clears it) |
 
 To search, press **/**, type a word or two, then press **Enter** to apply the
 filter. Press **Esc** to clear it and see everything again.

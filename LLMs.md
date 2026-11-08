@@ -107,9 +107,9 @@ Screens (`screen` enum): `screenAsk`, `screenAnswer`, `screenHistory`.
 | Screen | Keys |
 | --- | --- |
 | **Ask** | Enter ask · Ctrl+R last answer · Ctrl+H history · Esc quit |
-| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Esc deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
+| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Ctrl+P "print entire response": question + whole answer as one `.md` (`startSaveMarkdown`, `markdownDoc`). Saves go to `CODIE_SAVE_DIR` (`tui.EnvSaveDir`, `WithSaveDir`, `savePath`) for relative names; unset = launch folder · Esc or `q` deselect, then back (`q` is not a letter on these screens; it is still typeable in the ask box and in search) · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
 | **Save prompt** | Enter save · Esc cancel |
-| **History** | ↑/↓ move · `/` search · Enter open · Esc clear search, then back |
+| **History** | ↑/↓ move · `/` search · Enter open · Esc or `q` clear search, then back |
 | **Everywhere** | **Ctrl+C quits** (handled first in `Update`; never copies) |
 
 Notes:
