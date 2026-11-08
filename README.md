@@ -127,6 +127,34 @@ modern terminals support but some disable by default. Installing `xclip` or
 **Long lines look wrapped.** Answers are wrapped to fit your window so nothing
 runs off the screen. The copied or saved text is never wrapped.
 
+**The binary won't run on another machine** (for example, an error about a
+missing `libc` or `GLIBC` version). By default, Go links against your system's C
+library on Linux, so a binary built on one machine can fail on another. Turn that
+off to get a fully self-contained binary with nothing to install:
+
+```sh
+cd cli
+CGO_ENABLED=0 go build -o codie .
+```
+
+(Note it's `CGO_ENABLED=0`: *disabling* cgo is what makes the binary portable.)
+You can check the result with `ldd codie`, which should say "not a dynamic
+executable". Codie doesn't need cgo for anything, so nothing is lost.
+
+You can also build for another system from the one you're on by setting the
+target operating system and processor:
+
+```sh
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64  go build -o codie-linux-arm64 .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64  go build -o codie-mac-apple-silicon .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64  go build -o codie-mac-intel .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64  go build -o codie.exe .
+```
+
+One thing a portable binary can't carry with it is the clipboard helper: on
+Linux, copying still uses `xclip`, `xsel`, or `wl-copy` if they're installed on
+the machine you run it on (otherwise it falls back to OSC 52, described above).
+
 ## What's next
 
 - Connecting Codie to a real AI so answers are actually about your question

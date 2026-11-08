@@ -1,5 +1,7 @@
 # Built binary
 /cli/codie
+/cli/codie-*
+/cli/codie.exe
 
 # Test and editor leftovers
 *.test
