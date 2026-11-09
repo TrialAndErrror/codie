@@ -83,3 +83,6 @@ func (m *memStore) Append(e Entry) error {
 	m.entries = append(m.entries, e)
 	return nil
 }
+
+// EnvSaveDir names the environment variable that sets the default save folder.
+const EnvSaveDir = "CODIE_SAVE_DIR"

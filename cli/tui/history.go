@@ -24,7 +24,7 @@ func newHistoryView() historyView {
 	l.Title = "History"
 	l.SetShowHelp(true)
 	l.SetFilteringEnabled(true)
-	l.DisableQuitKeybindings() // esc/ctrl+c are ours: they navigate, not quit
+	l.DisableQuitKeybindings() // we own the keys: esc navigates, ctrl+c quits (see Model.Update)
 	return historyView{list: l}
 }
 
@@ -43,14 +43,12 @@ func (m Model) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// While the user is typing a search, every key belongs to the list.
 	if m.hist.list.FilterState() != list.Filtering {
 		switch msg.String() {
-		case "esc":
-			// First esc clears an applied search; the next one leaves the page.
+		case "esc", "q": // q does exactly what esc does
+			// First press clears an applied search; the next one leaves the page.
 			if m.hist.list.FilterState() == list.FilterApplied {
+				msg = tea.KeyMsg{Type: tea.KeyEsc} // the list clears its search on esc
 				break
 			}
-			m.screen = screenAsk
-			return m, nil
-		case "ctrl+c":
 			m.screen = screenAsk
 			return m, nil
 		case "enter":
@@ -68,7 +66,7 @@ func (m Model) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m Model) viewHistory() string {
 	if len(m.hist.list.Items()) == 0 {
-		return titleStyle.Render("History") + "\n\n" + helpStyle.Render("No questions yet.  esc to go back") + "\n"
+		return titleStyle.Render("History") + "\n\n" + helpStyle.Render("No questions yet.  esc or q to go back") + "\n"
 	}
-	return m.hist.list.View() + "\n" + helpStyle.Render("enter open • / search • esc back")
+	return m.hist.list.View() + "\n" + helpStyle.Render("enter open • / search • esc/q back")
 }
