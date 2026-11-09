@@ -10,10 +10,9 @@ it to save something.
 
 Press **Ctrl+C** at any time, on any screen, to quit.
 
-> **Preview.** Codie can answer with a real AI model through
-> [OpenRouter](https://openrouter.ai), or run in **demo mode** with sample code
-> snippets so you can try the interface first. It doesn't read your project
-> files yet; that's coming.
+Codie can answer with a real AI model through [OpenRouter](https://openrouter.ai),
+or run in **demo mode** with sample code snippets so you can try the interface
+first. It doesn't read your project files: it only answers the question you type.
 
 ## Getting started
 
@@ -126,9 +125,10 @@ you like and press **Enter**. The file goes in the folder you launched Codie
 from. Codie will never overwrite an existing file; if the name is taken you'll
 see a message and can try again with a different name. Press **Esc** to cancel.
 
-**Ctrl+P** ("print entire response") works the same way but saves the whole exchange: your question as a
-heading, then the full answer, as a single Markdown file you can open anywhere.
-It always saves everything, even if a code block is selected.
+**Ctrl+P** ("print entire response") works the same way but saves the whole
+exchange: your question as a heading, then the full answer, as a single Markdown
+file you can open anywhere. It always saves everything, even if a code block is
+selected.
 
 **Where saves go.** By default, in the folder you launched Codie from. To pick a
 different default, set `CODIE_SAVE_DIR` (for example `CODIE_SAVE_DIR=~/codie-snippets`
@@ -157,7 +157,7 @@ To search, press **/**, type a word or two, then press **Enter** to apply the
 filter. Press **Esc** to clear it and see everything again.
 
 Opening an old answer works just like a new one: you can scroll, copy, and
-save it. Press **Esc** to return to the list.
+save it. Press **Esc** (or **q**) to return to the list.
 
 ## Demo mode or a real model
 
@@ -285,6 +285,12 @@ revoked. Check `OPENROUTER_API_KEY` with `codie check`.
 `--model`) doesn't exist or isn't available to you. Copy the ID again from
 OpenRouter's model list.
 
+**"…guardrails or data-policy settings exclude every endpoint for it (404)."**
+The model exists, but your OpenRouter account's settings (a workspace guardrail or
+a privacy / zero-data-retention setting) don't allow it. Pick a model your
+settings allow, or change the setting named in the message details at
+openrouter.ai.
+
 **"…rate limiting you (429)."** Wait a moment and ask again.
 
 **"OpenRouter stopped responding."** No data arrived for a minute. Try again;
@@ -294,8 +300,9 @@ if it keeps happening, try a different model.
 for the model. Ask a narrower question.
 
 **Ctrl+H does nothing.** Some terminals (and tmux setups) send Ctrl+H as
-Backspace, so Codie can't tell the difference. Try a different terminal, or
-let us know. A second shortcut is an easy addition.
+Backspace, so Codie can't tell the difference. Try a different terminal or
+terminal settings. You can still ask questions and use **Ctrl+R** for the last
+answer without it.
 
 **Copy doesn't seem to work.** (Copying is **c**, on a selected code block;
 **Ctrl+C** quits.) Codie uses your system clipboard when it can
@@ -334,15 +341,6 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64  go build -o codie.exe .
 One thing a portable binary can't carry with it is the clipboard helper: on
 Linux, copying still uses `xclip`, `xsel`, or `wl-copy` if they're installed on
 the machine you run it on (otherwise it falls back to OSC 52, described above).
-
-## What's next
-
-- Trying the prompt against real models and tuning it. Small models won't always
-  follow the one-block-or-several format, and Codie copes (it shows whatever
-  arrives), but the answers may be less tidy
-- Letting the model read files in your project (with your permission, one
-  question at a time)
-- Technical documentation for contributors
 
 ## License
 

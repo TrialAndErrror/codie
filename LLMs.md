@@ -19,7 +19,7 @@ copy one block at a time, or save.
 
 **"A coding assistant, not a coding agent."** It is read-only with respect to the
 user's machine: it never runs code or edits files. The only thing it writes is a
-file the user explicitly saves (Ctrl+S). Keep it that way unless the user says
+file the user explicitly saves (Ctrl+S / Ctrl+P). Keep it that way unless the user says
 otherwise. (Planned file *reading* is allowed and described in section 9.)
 
 - Module name `codie`, Go module root is **`cli/`** (not the repo root). Run all
@@ -33,7 +33,7 @@ otherwise. (Planned file *reading* is allowed and described in section 9.)
 README.md            user-facing docs (install, keys, modes, model tips, troubleshooting)
 LLMs.md              this file
 LICENSE              MIT
-example.env          template for the 3 env vars; Codie does NOT load .env itself (user sources it)
+example.env          template for the 4 env vars (key, model, base URL, save dir); Codie does NOT load .env itself (user sources it)
 cli/
   main.go            calls cmd.Execute()
   cmd/               CLI wiring (Cobra): flags, mode selection, `codie check`
@@ -51,8 +51,8 @@ cli/
     blocks.go          parseAnswer: splits an answer into prose + fenced code blocks
     snippet.go         withBanner: Begin/End markers (as comments in the block's language) for `c`
     history.go         history screen (bubbles/list with search)
-    store.go           Entry, Store interface, JSONStore (disk), memStore (memory)
-    output.go          copyToClipboard, saveFile
+    store.go           Entry, Store interface, JSONStore (disk), memStore (memory), EnvSaveDir
+    output.go          copyToClipboard, savePath (CODIE_SAVE_DIR rules), saveFile
     researcher.go      FakeResearcher (demo backend; implements backend.Researcher)
     demo.go            16 canned answers, DemoEntries (fake history), NewMemStore
     testdata/fuzz/     fuzz regression inputs (commit these)
@@ -67,7 +67,8 @@ depends on `backend` only through the `Researcher` interface and `Event` type
 
 1. `main` → `cmd.Execute` → `rootCmd.RunE`.
 2. `loadConfig()` reads `OPENROUTER_API_KEY`, `CODIE_MODEL`, `CODIE_BASE_URL`
-   (`--model` overrides the model).
+   (`--model` overrides the model). `CODIE_SAVE_DIR` is a UI setting, read separately
+   in `root.go` and passed to the Model (not part of `backend.Config`).
 3. `resolveRuntime(cfg, demo, demoSet, storePath, now)` picks the backend, in order:
    1. `--demo` → demo, even if a key is set
    2. `--demo=false` → real (error if key/model missing)
@@ -79,7 +80,7 @@ depends on `backend` only through the `Researcher` interface and `Event` type
      seeded by `DemoEntries`. **Never touches disk.** Label `demo · sample answers…`.
    - **real:** `backend.NewOpenRouter(cfg)` + `JSONStore` at `DefaultStorePath()`
      (`os.UserConfigDir()/codie/history.json`). Label `OpenRouter · <model>`.
-5. `tui.New(researcher, store).WithLabel(label)` run in `tea.NewProgram(m, tea.WithAltScreen())`.
+5. `tui.New(researcher, store).WithLabel(label).WithSaveDir(dir)` run in `tea.NewProgram(m, tea.WithAltScreen())`.
 
 ### Asking a question (the streaming path)
 
@@ -107,12 +108,15 @@ Screens (`screen` enum): `screenAsk`, `screenAnswer`, `screenHistory`.
 | Screen | Keys |
 | --- | --- |
 | **Ask** | Enter ask · Ctrl+R last answer · Ctrl+H history · Esc quit |
-| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Ctrl+P "print entire response": question + whole answer as one `.md` (`startSaveMarkdown`, `markdownDoc`). Saves go to `CODIE_SAVE_DIR` (`tui.EnvSaveDir`, `WithSaveDir`, `savePath`) for relative names; unset = launch folder · Esc or `q` deselect, then back (`q` is not a letter on these screens; it is still typeable in the ask box and in search) · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
+| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Ctrl+P "print entire response" (question + whole answer as one `.md`) · Esc or `q` deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
 | **Save prompt** | Enter save · Esc cancel |
 | **History** | ↑/↓ move · `/` search · Enter open · Esc or `q` clear search, then back |
 | **Everywhere** | **Ctrl+C quits** (handled first in `Update`; never copies) |
 
 Notes:
+- `q` is a second `Esc` on the answer and history screens only (`updateAnswer`,
+  `updateHistory`). It stays an ordinary letter in the ask box, the save prompt, and
+  while typing a history search.
 - `j/k/↑/↓` select blocks only when `canSelect()` (answer finished, no error, ≥1
   selectable block). Otherwise they scroll the viewport (the bubbles viewport
   keymap already binds j/k).
@@ -153,7 +157,12 @@ never altered (tests check it byte for byte).
 `startSave` captures `saveText`/`saveWhat` at open time; the filename suggestion
 is `slug(question)` + `extFor(lang)` for a block (table `langExt`, anything else
 `.txt` so a model can't steer the filename) or `.txt` for the whole answer.
-`saveFile` uses `O_EXCL`: **never overwrites**.
+`saveFile` uses `O_EXCL`: **never overwrites**. `startSaveMarkdown` (Ctrl+P) saves
+`markdownDoc(question, raw)` (`# question`, blank line, the raw answer) as `<slug>.md`, always the
+whole exchange even if a block is selected. Where a save goes: `savePath(dir, name)`: an
+absolute typed name is used as is; a relative one goes in `CODIE_SAVE_DIR` (leading `~`
+expanded; unset = the launch folder); `saveFile` creates missing parent folders. The status
+line shows the full path.
 
 ### Parsing (`blocks.go`)
 
@@ -274,7 +283,7 @@ containing **`fail`** errors immediately. Failed requests don't consume a snippe
 ```sh
 cd cli
 gofmt -l . ; go vet ./...
-go test -count=1 -race ./...                 # ~230 cases, a few seconds
+go test -count=1 -race ./...                 # ~300 cases incl. subtests, a few seconds
 go test -run xxx -fuzz=FuzzParseAnswer -fuzztime=20s ./tui/
 go test -run xxx -fuzz=FuzzSanitize   -fuzztime=20s ./backend/
 CGO_ENABLED=0 go build -o codie .            # portable static binary
@@ -334,6 +343,9 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
   blocks, so j/k step through the work gently. `j`/`k` select blocks, `c` copies one **with Begin/End
   markers** (comments in the block's language; the user's requested look), `C` copies it plain,
   **Ctrl+C is the stop signal** (not copy).
+- Saving: Ctrl+S (block or whole answer) and Ctrl+P (question + answer as Markdown, the
+  user's name for it is "print entire response"). `CODIE_SAVE_DIR` sets the default folder.
+  `q` equals `Esc` when browsing (not while typing).
 - File reading (not built yet): the model *asks* for files via tool calls;
   root = git root, else the current directory; **approval once per question**
   before the first read; read-only tools only.
@@ -347,7 +359,8 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - License MIT. `README.md` stays non-technical; technical docs come after the backend.
 
 **Done:** TUI (ask/answer/history), demo mode, streaming OpenRouter backend,
-`codie check`, mode selection, prompt v1, block selection/copy/save, sanitizing.
+`codie check`, mode selection, walkthrough prompt, block selection/copy (with markers)/save,
+Ctrl+P markdown export, `CODIE_SAVE_DIR`, sanitizing.
 
 **Next (in rough order)**
 1. Run `codie check --live` and real questions on a cheap model (`example.env` and
@@ -362,13 +375,16 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
    Tool-call arguments stream in fragments and must be reassembled.
 3. Open idea, not decided: `CODIE_MAX_TOKENS` to force truncation and see the
    "cut off" error on any model.
-4. Technical docs for contributors; merge `feature/add-backend` to `main`.
+4. Convert the demo answers to the walkthrough format (section 7). Technical docs for
+   contributors; merge the feature branches to `main`.
 
 **Known gaps / honest limits**
 - The OpenRouter client has only been tested against local fakes, not the live service.
 - Prose is rendered as plain wrapped text (no markdown styling); long code lines wrap.
 - Bidirectional-text control characters (e.g. U+202E) are not stripped; only controls
   that drive the terminal are.
+- Saved answers land in the launch folder by default (`CODIE_SAVE_DIR` unset); `.gitignore`
+  only covers `/cli/*.txt`, so saved `.md`/code files there show up in `git status`.
 - The `v0.1` tag is local, points at the first commit, and predates the license.
 
 ## 10. Working agreements with this user
