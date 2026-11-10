@@ -69,11 +69,13 @@ type Model struct {
 	// answer screen
 	pane        viewport.Model
 	spin        spinner.Model
-	paneTitle   string // the question being shown
-	raw         string // the answer exactly as generated (what copy/save use); partial while streaming
-	paneErr     string // set when the request failed; raw then holds whatever arrived before the failure
-	loading     bool   // a request is in flight (streaming)
-	activity    string // latest status from the backend, e.g. "reading main.go"
+	paneTitle   string        // the question being shown
+	raw         string        // the answer exactly as generated (what copy/save use); partial while streaming
+	paneErr     string        // set when the request failed; raw then holds whatever arrived before the failure
+	loading     bool          // a request is in flight (streaming)
+	activity    string        // latest status from the backend, e.g. "reading main.go"
+	asking      bool          // the backend is waiting for a yes/no to read files
+	approval    backend.Event // that request (Text and Reply)
 	events      <-chan backend.Event
 	blocks      []blockRef // selectable code blocks in the answer, in order; rebuilt on every render
 	sel         int        // index into blocks of the highlighted one, or -1 for none
@@ -176,6 +178,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.quit() // the regular stop signal, on every screen
 		}
 		m.status = ""
+		if m.asking {
+			return m.updateApproval(msg)
+		}
 		switch m.screen {
 		case screenAsk:
 			return m.updateAsk(msg)
@@ -527,6 +532,11 @@ func (m Model) handleEvent(msg eventMsg) (tea.Model, tea.Cmd) {
 		}
 	case backend.Activity:
 		m.activity = msg.ev.Text
+	case backend.Approval:
+		// Stop reading events until the user answers: the backend is paused
+		// on this question, and updateApproval resumes the stream.
+		m.asking, m.approval = true, msg.ev
+		return m, nil
 	case backend.Done:
 		m.finish()
 		return m, nil
@@ -535,6 +545,25 @@ func (m Model) handleEvent(msg eventMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, waitEvent(msg.id, m.events)
+}
+
+// updateApproval handles keys while the backend waits for permission to read
+// files. Only y, n and Esc do anything; nothing is read until the user says y.
+func (m Model) updateApproval(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	answer := func(yes bool) (tea.Model, tea.Cmd) {
+		m.asking = false
+		m.approval.Reply <- yes // buffered: never blocks
+		return m, waitEvent(m.reqID, m.events)
+	}
+	switch msg.String() {
+	case "y", "Y":
+		return answer(true)
+	case "n", "N":
+		return answer(false)
+	case "esc":
+		m.cancelRequest()
+	}
+	return m, nil
 }
 
 // finish completes a successful answer and records it in history.
@@ -566,7 +595,7 @@ func (m *Model) endRequest() {
 		m.cancel()
 		m.cancel = nil
 	}
-	m.loading, m.activity, m.events = false, "", nil
+	m.loading, m.activity, m.events, m.asking = false, "", nil, false
 }
 
 // cancelRequest abandons the in-flight request; its remaining events are ignored.
@@ -745,6 +774,8 @@ func (m Model) viewAnswer() string {
 	switch {
 	case m.saving:
 		footer = m.saveInput.View()
+	case m.asking:
+		footer = statusStyle.Render(truncate(m.approval.Text, max(m.w, 20))) + helpStyle.Render("  y yes • n no • esc cancel")
 	case m.loading:
 		footer = m.spin.View() + helpStyle.Render(" "+m.progressText()+" • esc cancel")
 	default:

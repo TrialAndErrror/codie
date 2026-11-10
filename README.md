@@ -5,8 +5,15 @@ A coding assistant, not a coding agent.
 Codie lives in your terminal. You ask it how to build something, and it walks
 you through it step by step: a few sentences explaining the next step, then a short
 code block, then a few more sentences, then the next block. You can step through
-the code blocks, copy one, or save it. It never touches your files unless you tell
+the code blocks, copy one, or save it. It never changes your files unless you tell
 it to save something.
+
+With a real model, Codie can also look at your project to answer questions about it.
+Before it reads anything it asks, once per question: press **y** to allow or **n** to
+refuse. It can only read the folder you started Codie in and the folders inside it
+(never anything above it), it skips secrets such as `.env` files and private keys and anything your
+`.gitignore` excludes (this needs `git` installed), and
+it only reads: it can't change or run anything. What it reads is sent to the model.
 
 Press **Ctrl+C** at any time, on any screen, to quit.
 

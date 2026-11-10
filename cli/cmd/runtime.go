@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"time"
 
 	"codie/backend"
@@ -52,6 +53,13 @@ func realRuntime(cfg backend.Config, storePath func() (string, error)) (runtime,
 	path, err := storePath()
 	if err != nil {
 		return runtime{}, err
+	}
+	// The model may read files in the folder Codie was started in, and its
+	// children, but only after the user approves (once per question).
+	if wd, err := os.Getwd(); err == nil {
+		if ft, err := backend.NewFileTools(wd); err == nil {
+			o.Files = ft
+		}
 	}
 	return runtime{
 		Researcher: o,

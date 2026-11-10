@@ -20,7 +20,7 @@ copy one block at a time, or save.
 **"A coding assistant, not a coding agent."** It is read-only with respect to the
 user's machine: it never runs code or edits files. The only thing it writes is a
 file the user explicitly saves (Ctrl+S / Ctrl+P). Keep it that way unless the user says
-otherwise. (Planned file *reading* is allowed and described in section 9.)
+otherwise. It can *read* files under the launch folder, with approval (section 5, "File tools").
 
 - Module name `codie`, Go module root is **`cli/`** (not the repo root). Run all
   `go` commands from `cli/`. Go version per `cli/go.mod`.
@@ -45,6 +45,7 @@ cli/
     config.go          Config, env var names, Validate, MaskedKey
     openrouter.go      the OpenRouter client (SSE parsing, errors, cancel, idle timeout)
     prompt.go          DefaultSystemPrompt (the step-by-step answer format the UI depends on)
+    tools.go           FileTools: sandboxed read-only list_dir / read_file for the model
     sanitize.go        Sanitize: strips terminal control characters from untrusted text
   tui/               the Bubble Tea UI + local data
     model.go           Model, Update/View, all three screens, streaming, selection, render
@@ -91,7 +92,10 @@ depends on `backend` only through the `Researcher` interface and `Event` type
 
 - `Text` → append to `m.raw`, re-render, keep following the bottom *only if the
   user was already at the bottom*.
-- `Activity` → status line (nothing emits these yet; UI is ready for file tools).
+- `Activity` → status line ("reading main.go"), emitted by file tools.
+- `Approval` → `m.asking`; the UI **stops waiting for events** and shows "Allow?" in the
+  footer. `y`/`n` send the bool on `ev.Reply` and resume `waitEvent`; Esc cancels the
+  request (never counts as yes). All other keys are ignored while asking (`updateApproval`).
 - `Done` → `finish()`: reject empty answers, else append to history + store.
 - `Error` or channel closed without a terminal event → `fail()`: keep the partial
   text on screen, show the reason, **never store/copy/save it**.
@@ -206,6 +210,38 @@ event). It must **never block forever on a consumer that left** (select on
 - `redact()` (used by `errorf`/`httpError`): replaces the API key with `[redacted]`
   and runs `Sanitize`. **Every user-visible error string goes through it.**
 - Text events are `Sanitize`d before being sent.
+
+### File tools (`tools.go`, and the loop in `openrouter.go`)
+
+Real mode only (demo has no tools). `realRuntime` sets `OpenRouter.Files` =
+`NewFileTools(os.Getwd())`: **the root is the folder Codie was launched from and its
+children** (not the git root; the user asked for exactly that). Tools: `list_dir(path)`,
+`read_file(path, start_line?)`. `OpenRouter.Files == nil` means no tools are sent at all.
+
+- **Loop:** `run` calls `round` (one streamed request). Tool-call arguments arrive in
+  fragments by `index` and are reassembled. If the reply has calls, it asks for approval
+  (once per question, before the first read), runs them, appends the assistant + `tool`
+  messages, and requests again, until a reply has no calls. `filesPrompt` is appended to
+  the system prompt only when tools are on (it asks for no text before/between tool
+  calls; a model that ignores that leaks chatter into the answer).
+- **Approval:** an `Approval` event with a buffered `Reply` chan. The idle watchdog is
+  stopped while waiting on the person. **No** → tool results say so, no file is read,
+  and tools are no longer offered. Cancel while waiting ends the stream silently.
+- **Sandbox (`resolve`):** path → `EvalSymlinks` → must be inside the (symlink-resolved)
+  root, else refused; so `..`, absolute paths and symlinks out all fail. `blockedPath`
+  refuses `.git`, `.env`/`.env.*` (not `.example/.sample/.template/.dist`), `.ssh`, `.aws`,
+  `.gnupg`, `*.pem`, `*.key`, `id_rsa*` etc, `credentials*`, `.netrc`... `list_dir` hides
+  those and any symlink that escapes. **`.gitignore` is honored** by asking git
+  (`git check-ignore -z --stdin`, in `ignored`): nested files, global ignores and negations
+  behave as for the user, a root inside a bigger repo works, and `list_dir` checks a whole
+  folder in one call. Tracked files are not "ignored" (git's rule). If git is missing or
+  the root isn't in a repo, nothing is excluded (fails open; the approval prompt remains).
+  Limits: 15 calls per question (`MaxToolCalls`; then
+  tools are withdrawn), 64 KB and 400 lines per read (`start_line` continues), binary
+  files refused, 200 list entries. Errors go back to the model as text, never as `Error`.
+- **Not done:** files read are not recorded in history; no
+  content search tool; a check-then-open race on the path exists (single local user).
+  Note file contents go to the model provider, so the ZDR caveats in section 9 apply to them too.
 
 ### Config (`config.go`)
 
@@ -346,9 +382,9 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - Saving: Ctrl+S (block or whole answer) and Ctrl+P (question + answer as Markdown, the
   user's name for it is "print entire response"). `CODIE_SAVE_DIR` sets the default folder.
   `q` equals `Esc` when browsing (not while typing).
-- File reading (not built yet): the model *asks* for files via tool calls;
-  root = git root, else the current directory; **approval once per question**
-  before the first read; read-only tools only.
+- File reading (built): the model *asks* for files via tool calls; **root = the launch
+  folder and its children** (user's request; overrides the earlier "git root" idea);
+  **approval once per question** before the first read; read-only tools only.
 - Models: the user must use **Haiku, GLM or DeepSeek, and only ones with a
   zero-data-retention (ZDR) endpoint on OpenRouter**. `example.env` lists the picks.
   **Codie does not enforce ZDR in code** (the user chose not to). Enforcement is the
@@ -359,7 +395,7 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - License MIT. `README.md` stays non-technical; technical docs come after the backend.
 
 **Done:** TUI (ask/answer/history), demo mode, streaming OpenRouter backend,
-`codie check`, mode selection, walkthrough prompt, block selection/copy (with markers)/save,
+`codie check`, mode selection, file tools with approval, walkthrough prompt, block selection/copy (with markers)/save,
 Ctrl+P markdown export, `CODIE_SAVE_DIR`, sanitizing.
 
 **Next (in rough order)**
@@ -368,11 +404,9 @@ Ctrl+P markdown export, `CODIE_SAVE_DIR`, sanitizing.
    README deliberately does not list free models any more, and free models may
    retain prompts, so only throwaway questions on those). Then tune the prompt from
    real output.
-2. File tools: read file / list dir / search; guardrails: stay inside the root,
-   refuse symlink escapes, respect `.gitignore`, skip secrets (`.env`, keys), cap file
-   sizes and tool calls per question; the approval prompt; emit `Activity` events
-   (`reading path/to/file`); record which files were read alongside each history entry.
-   Tool-call arguments stream in fragments and must be reassembled.
+2. File tools, remaining: a search tool; record which files were
+   read alongside each history entry; try it against a real tool-calling model (only
+   tested against local fakes so far).
 3. Open idea, not decided: `CODIE_MAX_TOKENS` to force truncation and see the
    "cut off" error on any model.
 4. Convert the demo answers to the walkthrough format (section 7). Technical docs for

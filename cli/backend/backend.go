@@ -15,8 +15,12 @@ const (
 	// Text is the next chunk of the answer.
 	Text Kind = iota
 	// Activity is a status line for the user, such as "reading main.go".
-	// (Nothing emits these until file tools arrive; the UI already shows them.)
 	Activity
+	// Approval asks the user for permission before the first file read of a
+	// question. Text says what is being asked. The consumer must send exactly
+	// one value on Reply (it is buffered, so sending never blocks); the
+	// producer waits for it, or for ctx to be cancelled.
+	Approval
 	// Done means the answer finished normally. It is always the last event.
 	Done
 	// Error means the answer failed. It is always the last event. Any Text
@@ -29,12 +33,14 @@ type Event struct {
 	Kind Kind
 	Text string // for Text and Activity
 	Err  error  // for Error
+
+	Reply chan<- bool // for Approval: true allows the reads
 }
 
 // Researcher answers a question as a stream.
 //
 // Contract:
-//   - zero or more Text/Activity events, then exactly one Done or Error, then
+//   - zero or more Text/Activity/Approval events, then exactly one Done or Error, then
 //     the channel is closed;
 //   - if ctx is cancelled the implementation stops promptly and closes the
 //     channel, possibly without a terminal event;

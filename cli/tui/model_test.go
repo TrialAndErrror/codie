@@ -917,3 +917,78 @@ func TestEndToEndSecondQuestionAfterFailureWorks(t *testing.T) {
 		t.Fatalf("recovery failed: raw=%q err=%q stored=%d", h.model().raw, h.model().paneErr, len(h.store.entries))
 	}
 }
+
+// ---- file-read approval ----------------------------------------------------
+
+// askForFiles starts a question and delivers an approval request, returning
+// the channel the answer will arrive on.
+func askForFiles(h *harness) chan bool {
+	h.start("what does main.go do?")
+	reply := make(chan bool, 1)
+	h.emit(backend.Event{Kind: backend.Approval, Text: "Codie wants to read files in /proj. Allow?", Reply: reply})
+	return reply
+}
+
+func TestApprovalPromptWaitsForAnAnswer(t *testing.T) {
+	h := newHarness(t)
+	reply := askForFiles(h)
+	m := h.model()
+	if !m.asking || !strings.Contains(m.View(), "Allow?") || !strings.Contains(m.View(), "y yes") {
+		t.Fatalf("prompt not shown:\n%s", m.View())
+	}
+	// Keys other than y/n/esc do nothing, and nothing has been answered.
+	h.typ("x")
+	h.key(tea.KeyEnter)
+	if !h.model().asking || len(reply) != 0 {
+		t.Fatalf("answered without y or n")
+	}
+
+	h.typ("y")
+	if h.model().asking {
+		t.Fatalf("still asking after y")
+	}
+	if yes := <-reply; !yes {
+		t.Fatalf("y should allow")
+	}
+}
+
+func TestApprovalNoDenies(t *testing.T) {
+	h := newHarness(t)
+	reply := askForFiles(h)
+	h.typ("n")
+	if yes := <-reply; yes {
+		t.Fatalf("n should deny")
+	}
+	if !h.model().loading {
+		t.Fatalf("the question should carry on after a no")
+	}
+}
+
+func TestEscDuringApprovalCancelsTheQuestion(t *testing.T) {
+	h := newHarness(t)
+	reply := askForFiles(h)
+	ctx := h.stub.lastCtx()
+	h.key(tea.KeyEsc)
+	m := h.model()
+	if m.asking || m.loading || ctx.Err() == nil {
+		t.Fatalf("asking=%v loading=%v ctxErr=%v", m.asking, m.loading, ctx.Err())
+	}
+	if len(reply) != 0 {
+		t.Fatalf("esc must not count as yes")
+	}
+}
+
+func TestAnswerStreamsAfterApproval(t *testing.T) {
+	h := newHarness(t)
+	askForFiles(h)
+	h.typ("y")
+	h.emit(backend.Event{Kind: backend.Activity, Text: "reading main.go"})
+	if got := h.model().activity; got != "reading main.go" {
+		t.Fatalf("activity: %q", got)
+	}
+	h.text("It starts the app.")
+	h.done()
+	if h.model().raw != "It starts the app." {
+		t.Fatalf("raw: %q", h.model().raw)
+	}
+}

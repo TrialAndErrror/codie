@@ -217,8 +217,8 @@ func TestRequestShape(t *testing.T) {
 		t.Fatalf("body: %+v", body)
 	}
 	if len(body.Messages) != 2 ||
-		body.Messages[0] != (chatMessage{"system", "be brief"}) ||
-		body.Messages[1] != (chatMessage{"user", "how do I loop?"}) {
+		body.Messages[0].Role != "system" || body.Messages[0].Content != "be brief" ||
+		body.Messages[1].Role != "user" || body.Messages[1].Content != "how do I loop?" {
 		t.Fatalf("messages: %+v", body.Messages)
 	}
 }
