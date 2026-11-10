@@ -117,8 +117,34 @@ type chunk struct {
 	} `json:"choices"`
 }
 
-// Research implements Researcher.
+// Research implements Researcher: a question with no earlier context.
 func (o *OpenRouter) Research(ctx context.Context, question string) <-chan Event {
+	return o.Converse(ctx, nil, question)
+}
+
+// Limits on how much earlier conversation is sent along with a follow-up, so a
+// long thread can't grow the request (and its cost) without bound. The newest
+// turns are kept.
+const (
+	maxHistoryTurns = 8
+	maxHistoryChars = 40000
+)
+
+// trimHistory keeps the newest turns that fit the limits above.
+func trimHistory(h []Turn) []Turn {
+	size, keep := 0, 0
+	for i := len(h) - 1; i >= 0 && keep < maxHistoryTurns; i-- {
+		size += len(h[i].Question) + len(h[i].Answer)
+		if size > maxHistoryChars && keep > 0 {
+			break
+		}
+		keep++
+	}
+	return h[len(h)-keep:]
+}
+
+// Converse implements Conversational.
+func (o *OpenRouter) Converse(ctx context.Context, history []Turn, question string) <-chan Event {
 	out := make(chan Event)
 	go func() {
 		defer close(out)
@@ -130,7 +156,7 @@ func (o *OpenRouter) Research(ctx context.Context, question string) <-chan Event
 				return false
 			}
 		}
-		o.run(ctx, question, send)
+		o.run(ctx, trimHistory(history), question, send)
 	}()
 	return out
 }
@@ -147,7 +173,7 @@ type roundResult struct {
 	calls   []toolCall
 }
 
-func (o *OpenRouter) run(ctx context.Context, question string, send func(Event) bool) {
+func (o *OpenRouter) run(ctx context.Context, history []Turn, question string, send func(Event) bool) {
 	// rctx is cancelled by the caller (ctx) or by our idle watchdog.
 	rctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -179,10 +205,13 @@ func (o *OpenRouter) run(ctx context.Context, question string, send func(Event) 
 	if tools {
 		system += filesPrompt
 	}
-	messages := []chatMessage{
-		{Role: "system", Content: system},
-		{Role: "user", Content: question},
+	messages := []chatMessage{{Role: "system", Content: system}}
+	for _, t := range history {
+		messages = append(messages,
+			chatMessage{Role: "user", Content: t.Question},
+			chatMessage{Role: "assistant", Content: t.Answer})
 	}
+	messages = append(messages, chatMessage{Role: "user", Content: question})
 
 	var (
 		asked, allowed bool

@@ -69,11 +69,14 @@ type Model struct {
 	// answer screen
 	pane        viewport.Model
 	spin        spinner.Model
-	paneTitle   string        // the question being shown
-	raw         string        // the answer exactly as generated (what copy/save use); partial while streaming
-	paneErr     string        // set when the request failed; raw then holds whatever arrived before the failure
-	loading     bool          // a request is in flight (streaming)
-	activity    string        // latest status from the backend, e.g. "reading main.go"
+	paneTitle   string         // the question being shown
+	raw         string         // the answer exactly as generated (what copy/save use); partial while streaming
+	paneErr     string         // set when the request failed; raw then holds whatever arrived before the failure
+	loading     bool           // a request is in flight (streaming)
+	activity    string         // latest status from the backend, e.g. "reading main.go"
+	thread      []backend.Turn // the conversation so far on this answer, for follow-ups
+	following   bool           // the follow-up prompt is open
+	followInput textinput.Model
 	asking      bool          // the backend is waiting for a yes/no to read files
 	approval    backend.Event // that request (Text and Reply)
 	events      <-chan backend.Event
@@ -102,6 +105,11 @@ func New(r backend.Researcher, s Store) Model {
 	ti.CharLimit = 500
 	ti.Focus()
 
+	fi := textinput.New()
+	fi.Prompt = "↳ "
+	fi.Placeholder = "Follow up…"
+	fi.CharLimit = 500
+
 	si := textinput.New()
 	si.Prompt = "Save as: "
 	si.CharLimit = 200
@@ -111,15 +119,16 @@ func New(r backend.Researcher, s Store) Model {
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 
 	m := Model{
-		researcher: r,
-		store:      s,
-		copyFn:     copyToClipboard,
-		input:      ti,
-		saveInput:  si,
-		spin:       sp,
-		pane:       viewport.New(80, 20),
-		sel:        -1,
-		hist:       newHistoryView(),
+		researcher:  r,
+		store:       s,
+		copyFn:      copyToClipboard,
+		input:       ti,
+		saveInput:   si,
+		followInput: fi,
+		spin:        sp,
+		pane:        viewport.New(80, 20),
+		sel:         -1,
+		hist:        newHistoryView(),
 	}
 	entries, err := s.Load()
 	if err != nil {
@@ -213,6 +222,8 @@ func (m Model) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case screenAnswer:
 		if m.saving {
 			m.saveInput, cmd = m.saveInput.Update(msg)
+		} else if m.following {
+			m.followInput, cmd = m.followInput.Update(msg)
 		} else {
 			m.pane, cmd = m.pane.Update(msg)
 		}
@@ -234,15 +245,9 @@ func (m Model) updateAsk(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if q == "" {
 			return m, nil
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		m.reqID++
-		m.cancel, m.loading, m.activity = cancel, true, ""
 		m.input.Reset()
-		m.showPane(q, "", "")
-		m.fromHistory = false
-		m.screen = screenAnswer
-		m.events = m.researcher.Research(ctx, q)
-		return m, tea.Batch(m.spin.Tick, waitEvent(m.reqID, m.events))
+		m.thread = nil // a new question starts a new conversation
+		return m.startRequest(q)
 
 	case "ctrl+r":
 		if len(m.entries) == 0 {
@@ -265,14 +270,69 @@ func (m Model) updateAsk(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// startRequest asks q, with the conversation so far (m.thread) as context, and
+// shows the answer streaming in.
+func (m Model) startRequest(q string) (tea.Model, tea.Cmd) {
+	ctx, cancel := context.WithCancel(context.Background())
+	m.reqID++
+	m.cancel, m.loading, m.activity = cancel, true, ""
+	m.showPane(q, "", "")
+	m.fromHistory = false
+	m.screen = screenAnswer
+	if c, ok := m.researcher.(backend.Conversational); ok {
+		m.events = c.Converse(ctx, m.thread, q)
+	} else {
+		m.events = m.researcher.Research(ctx, q)
+	}
+	return m, tea.Batch(m.spin.Tick, waitEvent(m.reqID, m.events))
+}
+
 // ---- answer screen --------------------------------------------------------
+
+// canFollowUp reports whether a follow-up can be asked: the answer must be
+// finished and good, since a failed or half-written one is no basis to build on.
+func (m Model) canFollowUp() bool {
+	return !m.loading && !m.asking && m.paneErr == "" && strings.TrimSpace(m.raw) != "" && len(m.thread) > 0
+}
+
+// updateFollowUp handles keys while the follow-up prompt is open.
+func (m Model) updateFollowUp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.following = false
+		m.followInput.Blur()
+		return m, nil
+	case "enter":
+		q := strings.TrimSpace(m.followInput.Value())
+		if q == "" {
+			return m, nil
+		}
+		m.followInput.Reset()
+		m.followInput.Blur()
+		return m.startRequest(q) // showPane closes the prompt
+	}
+	var cmd tea.Cmd
+	m.followInput, cmd = m.followInput.Update(msg)
+	return m, cmd
+}
 
 func (m Model) updateAnswer(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.saving {
 		return m.updateSaving(msg)
 	}
+	if m.following {
+		return m.updateFollowUp(msg)
+	}
 
 	switch msg.String() {
+	case "enter":
+		if !m.canFollowUp() {
+			return m, nil
+		}
+		m.following = true
+		m.followInput.Focus()
+		return m, textinput.Blink
+
 	case "esc", "q": // q is a second way to go up one level
 		if m.sel >= 0 { // first esc leaves block selection and shows the whole answer again
 			m.sel = -1
@@ -573,6 +633,7 @@ func (m *Model) finish() {
 		return
 	}
 	m.endRequest()
+	m.thread = append(m.thread, backend.Turn{Question: m.paneTitle, Answer: m.raw})
 	e := Entry{Question: m.paneTitle, Answer: m.raw, At: time.Now()}
 	m.entries = append(m.entries, e)
 	if err := m.store.Append(e); err != nil {
@@ -608,13 +669,14 @@ func (m *Model) openEntry(e Entry, fromHistory bool) {
 	// History comes from a file on disk, so sanitize it like anything else
 	// shown in the terminal.
 	m.showPane(e.Question, backend.Sanitize(e.Answer), "")
+	m.thread = []backend.Turn{{Question: e.Question, Answer: backend.Sanitize(e.Answer)}}
 	m.fromHistory = fromHistory
 	m.screen = screenAnswer
 }
 
 func (m *Model) showPane(title, raw, errText string) {
 	m.paneTitle, m.raw, m.paneErr = title, raw, errText
-	m.saving, m.sel = false, -1
+	m.saving, m.following, m.sel = false, false, -1
 	m.renderPane()
 	m.pane.GotoTop()
 }
@@ -727,6 +789,7 @@ func (m *Model) layout() {
 	m.pane.Width = max(m.w, 1)
 	m.pane.Height = max(m.h-chrome, 1)
 	m.saveInput.Width = max(m.w-12, 10)
+	m.followInput.Width = max(m.w-12, 10)
 	m.hist.list.SetSize(m.w, max(m.h-2, 1))
 	m.renderPane()
 	m.revealSelection()
@@ -774,6 +837,8 @@ func (m Model) viewAnswer() string {
 	switch {
 	case m.saving:
 		footer = m.saveInput.View()
+	case m.following:
+		footer = m.followInput.View()
 	case m.asking:
 		footer = statusStyle.Render(truncate(m.approval.Text, max(m.w, 20))) + helpStyle.Render("  y yes • n no • esc cancel")
 	case m.loading:
@@ -793,17 +858,17 @@ func (m Model) answerHelp() string {
 	pct := m.pane.ScrollPercent() * 100
 	switch {
 	case m.sel >= 0:
-		return m.blockLabel() + " • j/k • c copy • C plain • ctrl+s save • ctrl+p print • esc/q up"
+		return m.blockLabel() + " • j/k • c copy • C plain • enter follow up • ctrl+s save • esc up"
 	case m.canSelect():
 		plural := "s"
 		if len(m.blocks) == 1 {
 			plural = ""
 		}
-		return fmt.Sprintf("%d code block%s • j/k select • pgup/pgdn scroll • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", len(m.blocks), plural, pct)
+		return fmt.Sprintf("%d code block%s • j/k select • enter follow up • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", len(m.blocks), plural, pct)
 	case m.paneErr != "":
 		return fmt.Sprintf("↑/↓ scroll • esc/q back • %3.0f%%", pct)
 	}
-	return fmt.Sprintf("↑/↓ scroll • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", pct)
+	return fmt.Sprintf("↑/↓ scroll • enter follow up • ctrl+s save • ctrl+p print • esc/q back • %3.0f%%", pct)
 }
 
 // progressText is what we say while waiting: the backend's latest activity if

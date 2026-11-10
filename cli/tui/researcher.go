@@ -27,6 +27,12 @@ type FakeResearcher struct {
 }
 
 func (f *FakeResearcher) Research(ctx context.Context, question string) <-chan backend.Event {
+	return f.Converse(ctx, nil, question)
+}
+
+// Converse implements backend.Conversational. The demo has no memory, so the
+// earlier turns are ignored: a follow-up just gets the next canned answer.
+func (f *FakeResearcher) Converse(ctx context.Context, _ []backend.Turn, question string) <-chan backend.Event {
 	out := make(chan backend.Event)
 	idx := f.next.Load()
 	answer := snippets[idx%uint64(len(snippets))].Answer

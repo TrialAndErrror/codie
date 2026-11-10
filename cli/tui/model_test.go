@@ -992,3 +992,164 @@ func TestAnswerStreamsAfterApproval(t *testing.T) {
 		t.Fatalf("raw: %q", h.model().raw)
 	}
 }
+
+// ---- follow-ups ------------------------------------------------------------
+
+// convStub is a Conversational researcher that records the history it is given.
+type convStub struct {
+	stubResearcher
+	histories [][]backend.Turn
+}
+
+func (c *convStub) Converse(ctx context.Context, h []backend.Turn, q string) <-chan backend.Event {
+	c.mu.Lock()
+	c.histories = append(c.histories, append([]backend.Turn(nil), h...))
+	c.mu.Unlock()
+	return c.Research(ctx, q)
+}
+
+func newConvHarness(t *testing.T) (*harness, *convStub) {
+	t.Helper()
+	cs := &convStub{}
+	return newHarnessWith(t, cs, &cs.stubResearcher), cs
+}
+
+// answered asks q and completes it with the given answer.
+func (h *harness) answered(q, answer string) {
+	h.t.Helper()
+	h.start(q)
+	h.text(answer)
+	h.done()
+}
+
+func TestEnterOpensAFollowUpPromptAtTheBottom(t *testing.T) {
+	h, _ := newConvHarness(t)
+	h.answered("first", "an answer")
+	h.key(tea.KeyEnter)
+	m := h.model()
+	if !m.following || !strings.Contains(m.View(), "↳") {
+		t.Fatalf("prompt not open:\n%s", m.View())
+	}
+	lines := strings.Split(strings.TrimRight(m.View(), "\n"), "\n")
+	if !strings.Contains(lines[len(lines)-1], "↳") {
+		t.Fatalf("prompt should be the last line: %q", lines[len(lines)-1])
+	}
+}
+
+func TestFollowUpCarriesTheConversation(t *testing.T) {
+	h, cs := newConvHarness(t)
+	h.answered("first", "answer one")
+	h.key(tea.KeyEnter)
+	h.typ("and then?")
+	h.key(tea.KeyEnter)
+
+	m := h.model()
+	if m.following || !m.loading || m.paneTitle != "and then?" || m.raw != "" {
+		t.Fatalf("follow-up not started: following=%v loading=%v title=%q", m.following, m.loading, m.paneTitle)
+	}
+	if len(cs.histories) != 2 || len(cs.histories[0]) != 0 {
+		t.Fatalf("histories: %+v", cs.histories)
+	}
+	if h1 := cs.histories[1]; len(h1) != 1 || h1[0].Question != "first" || h1[0].Answer != "answer one" {
+		t.Fatalf("follow-up history: %+v", h1)
+	}
+
+	// A third question sees both earlier turns, in order.
+	h.text("answer two")
+	h.done()
+	h.key(tea.KeyEnter)
+	h.typ("more")
+	h.key(tea.KeyEnter)
+	h2 := cs.histories[2]
+	if len(h2) != 2 || h2[0].Question != "first" || h2[1].Question != "and then?" || h2[1].Answer != "answer two" {
+		t.Fatalf("third history: %+v", h2)
+	}
+	// Each exchange is stored in history on its own.
+	h.text("answer three")
+	h.done()
+	if got := h.store.entries; len(got) != 3 || got[1].Question != "and then?" {
+		t.Fatalf("stored: %+v", got)
+	}
+}
+
+func TestFollowUpPromptCanBeDismissedAndIgnoresEmpty(t *testing.T) {
+	h, cs := newConvHarness(t)
+	h.answered("first", "answer")
+	h.key(tea.KeyEnter)
+	h.key(tea.KeyEnter) // empty: nothing happens
+	if m := h.model(); !m.following || m.loading {
+		t.Fatalf("empty follow-up should do nothing")
+	}
+	h.typ("   ")
+	h.key(tea.KeyEnter)
+	if h.model().loading {
+		t.Fatalf("blank follow-up should do nothing")
+	}
+	h.key(tea.KeyEsc)
+	m := h.model()
+	if m.following || m.screen != screenAnswer || m.raw != "answer" || len(cs.histories) != 1 {
+		t.Fatalf("esc should just close the prompt: %+v", m.screen)
+	}
+}
+
+func TestNoFollowUpWhileStreamingOrAfterAFailure(t *testing.T) {
+	h, _ := newConvHarness(t)
+	h.start("first")
+	h.text("partial")
+	h.key(tea.KeyEnter)
+	if h.model().following {
+		t.Fatalf("follow-up opened mid-stream")
+	}
+	h.fail("boom")
+	h.key(tea.KeyEnter)
+	if h.model().following {
+		t.Fatalf("follow-up opened on a failed answer")
+	}
+}
+
+func TestFollowUpWorksWithABlockSelected(t *testing.T) {
+	h, _ := newConvHarness(t)
+	h.answered("first", "Some words.\n\n```go\nfmt.Println(1)\n```\n")
+	h.typ("j")
+	if h.model().sel < 0 {
+		t.Fatalf("block not selected")
+	}
+	h.key(tea.KeyEnter)
+	if !h.model().following {
+		t.Fatalf("enter should open the prompt with a block selected")
+	}
+}
+
+func TestNewQuestionStartsANewConversation(t *testing.T) {
+	h, cs := newConvHarness(t)
+	h.answered("first", "answer")
+	h.key(tea.KeyEsc) // back to ask
+	h.start("unrelated")
+	if got := cs.histories[len(cs.histories)-1]; len(got) != 0 {
+		t.Fatalf("a new question should carry no history: %+v", got)
+	}
+}
+
+func TestFollowUpFromAnOpenedHistoryEntry(t *testing.T) {
+	h, cs := newConvHarness(t)
+	h.answered("first", "answer")
+	h.key(tea.KeyEsc)
+	h.key(tea.KeyCtrlR) // reopen the last answer
+	h.key(tea.KeyEnter)
+	h.typ("why?")
+	h.key(tea.KeyEnter)
+	if got := cs.histories[len(cs.histories)-1]; len(got) != 1 || got[0].Question != "first" {
+		t.Fatalf("history: %+v", got)
+	}
+}
+
+func TestNonConversationalResearcherStillWorks(t *testing.T) {
+	h := newHarness(t) // stubResearcher has only Research
+	h.answered("first", "answer")
+	h.key(tea.KeyEnter)
+	h.typ("again")
+	h.key(tea.KeyEnter)
+	if got := h.stub.qs; len(got) != 2 || got[1] != "again" {
+		t.Fatalf("questions: %v", got)
+	}
+}

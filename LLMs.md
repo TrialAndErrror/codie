@@ -112,7 +112,8 @@ Screens (`screen` enum): `screenAsk`, `screenAnswer`, `screenHistory`.
 | Screen | Keys |
 | --- | --- |
 | **Ask** | Enter ask · Ctrl+R last answer · Ctrl+H history · Esc quit |
-| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · Ctrl+S save (selected block, else whole answer) · Ctrl+P "print entire response" (question + whole answer as one `.md`) · Esc or `q` deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
+| **Answer** | `j`/`↓` first/next code block · `k`/`↑` last/previous block (wraps) · `c` copy selected block **with Begin/End markers** · `C` copy it **plain** · **Enter follow-up prompt** (footer input `↳`; Enter send, Esc close) · Ctrl+S save (selected block, else whole answer) · Ctrl+P "print entire response" (question + whole answer as one `.md`) · Esc or `q` deselect, then back · PgUp/PgDn/`b`/`f`/`u`/`d`/space scroll · `g`/`G` top/bottom |
+| **Follow-up prompt** | Enter send (blank is ignored) · Esc close · other keys type |
 | **Save prompt** | Enter save · Esc cancel |
 | **History** | ↑/↓ move · `/` search · Enter open · Esc or `q` clear search, then back |
 | **Everywhere** | **Ctrl+C quits** (handled first in `Update`; never copies) |
@@ -210,6 +211,20 @@ event). It must **never block forever on a consumer that left** (select on
 - `redact()` (used by `errorf`/`httpError`): replaces the API key with `[redacted]`
   and runs `Sanitize`. **Every user-visible error string goes through it.**
 - Text events are `Sanitize`d before being sent.
+
+### Conversations
+
+`backend.Turn{Question, Answer}`; `backend.Conversational` = `Researcher` + `Converse(ctx,
+history, question)`. `OpenRouter` and `FakeResearcher` implement it (`Research` is
+`Converse` with no history; the demo ignores history). The TUI keeps `Model.thread`:
+appended in `finish()` (only successful answers), reset when a question is asked from the
+ask screen, and set to the single opened entry by `openEntry` (so following up on a history
+entry or Ctrl+R continues from that one exchange). `startRequest(q)` uses `Converse` when
+the researcher is `Conversational`, else plain `Research` (test stubs). History goes out as
+alternating user/assistant messages, trimmed by `trimHistory` to the newest 8 turns /
+40,000 chars (a lone oversized turn is kept). Tool calls and file contents from earlier
+turns are **not** replayed, only the questions and answers; each follow-up asks file-read
+approval again. Enter is ignored while streaming or after a failure (`canFollowUp`).
 
 ### File tools (`tools.go`, and the loop in `openrouter.go`)
 
@@ -374,7 +389,10 @@ CGO_ENABLED=0 go build -o codie .            # portable static binary
 - Provider: OpenRouter. Key from env var only (never stored, printed, or logged).
 - Model: set by `CODIE_MODEL` / `--model`; no default.
 - Answers stream. Copy/save wait until finished.
-- Each question is independent (no conversation memory yet).
+- Follow-ups: Enter on a finished answer opens a prompt at the bottom. A new question from
+  the ask screen is a fresh conversation; follow-ups continue it. See section 5, "Conversations".
+  The pane shows one answer at a time (the latest); earlier ones are in history. A scrolling
+  whole-thread view was not built (open idea).
 - Answer format: a **walkthrough**, words / code block / words / code block, 2–3 sentences between
   blocks, so j/k step through the work gently. `j`/`k` select blocks, `c` copies one **with Begin/End
   markers** (comments in the block's language; the user's requested look), `C` copies it plain,

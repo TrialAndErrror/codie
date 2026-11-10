@@ -50,6 +50,21 @@ type Researcher interface {
 	Research(ctx context.Context, question string) <-chan Event
 }
 
+// Turn is one finished question and its answer, the unit of a conversation.
+type Turn struct {
+	Question string
+	Answer   string
+}
+
+// Conversational is a Researcher that can continue a conversation: Converse is
+// Research with the earlier turns (oldest first) as context. Both real and demo
+// backends implement it; a Researcher that doesn't simply answers each
+// question on its own.
+type Conversational interface {
+	Researcher
+	Converse(ctx context.Context, history []Turn, question string) <-chan Event
+}
+
 // Collect drains a stream and returns the full text. It is a convenience for
 // callers (and tests) that don't need incremental output.
 func Collect(ch <-chan Event) (string, error) {

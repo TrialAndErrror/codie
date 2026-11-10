@@ -15,6 +15,12 @@ refuse. It can only read the folder you started Codie in and the folders inside 
 `.gitignore` excludes (this needs `git` installed), and
 it only reads: it can't change or run anything. What it reads is sent to the model.
 
+Press **Enter** on a finished answer to ask a follow-up. Codie remembers the
+conversation so far (the most recent exchanges), so you can say "now make it handle
+errors" without repeating yourself. Each follow-up shows its own answer, and every
+answer is saved to your history separately. Asking a new question from the first screen
+starts a fresh conversation.
+
 Press **Ctrl+C** at any time, on any screen, to quit.
 
 Codie can answer with a real AI model through [OpenRouter](https://openrouter.ai),
@@ -86,6 +92,7 @@ beside a thin bar. To work through it:
 | **k / ↑** | Select the last code block, then the previous one |
 | **c** | Copy the selected block, wrapped in Begin / End markers |
 | **C** | Copy the selected block as plain code, with no markers |
+| **Enter** | Ask a follow-up. A prompt opens at the bottom; Enter sends it, Esc closes it |
 | **Ctrl+S** | Save the selected block, or the whole answer if none is selected |
 | **Ctrl+P** | Print the entire response: your question and the whole answer, saved together as one Markdown (`.md`) file |
 | **PgUp / PgDn** (or **b / f**) | Scroll a page, even with a block selected |

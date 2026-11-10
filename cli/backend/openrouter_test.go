@@ -993,3 +993,62 @@ func TestOtherFailuresAreNotMistakenForTheLengthLimit(t *testing.T) {
 		})
 	}
 }
+
+// ---- conversations ---------------------------------------------------------
+
+func TestConverseSendsEarlierTurnsInOrder(t *testing.T) {
+	var got chatRequest
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		sse(w, delta("ok"), finishChunk("stop"), "[DONE]")
+	})
+	o := client(t, srv)
+	hist := []Turn{{"q1", "a1"}, {"q2", "a2"}}
+	if _, err := Collect(o.Converse(context.Background(), hist, "q3")); err != nil {
+		t.Fatal(err)
+	}
+	var seq []string
+	for _, m := range got.Messages {
+		seq = append(seq, m.Role+":"+m.Content)
+	}
+	want := []string{"system:" + DefaultSystemPrompt, "user:q1", "assistant:a1", "user:q2", "assistant:a2", "user:q3"}
+	if strings.Join(seq, "|") != strings.Join(want, "|") {
+		t.Fatalf("messages:\n%q\nwant\n%q", seq, want)
+	}
+}
+
+func TestResearchHasNoHistory(t *testing.T) {
+	var got chatRequest
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		sse(w, delta("ok"), finishChunk("stop"), "[DONE]")
+	})
+	Collect(client(t, srv).Research(context.Background(), "q"))
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages: %+v", got.Messages)
+	}
+}
+
+func TestTrimHistoryKeepsTheNewestWithinLimits(t *testing.T) {
+	var many []Turn
+	for i := 0; i < 20; i++ {
+		many = append(many, Turn{fmt.Sprint("q", i), "a"})
+	}
+	got := trimHistory(many)
+	if len(got) != maxHistoryTurns || got[len(got)-1].Question != "q19" {
+		t.Errorf("turn cap: %d turns, last %q", len(got), got[len(got)-1].Question)
+	}
+
+	big := strings.Repeat("x", maxHistoryChars/2)
+	got = trimHistory([]Turn{{"old", big}, {"mid", big}, {"new", big}})
+	if len(got) == 0 || got[len(got)-1].Question != "new" || len(got) >= 3 {
+		t.Errorf("size cap: %+v", got)
+	}
+	// A single oversized turn is still kept: the latest context beats none.
+	if got = trimHistory([]Turn{{"only", strings.Repeat("x", maxHistoryChars*2)}}); len(got) != 1 {
+		t.Errorf("lone big turn dropped")
+	}
+	if got = trimHistory(nil); len(got) != 0 {
+		t.Errorf("nil history: %v", got)
+	}
+}
