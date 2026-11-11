@@ -164,7 +164,12 @@ func (o *OpenRouter) Converse(ctx context.Context, history []Turn, question stri
 // filesPrompt is added to the system prompt when file tools are on.
 const filesPrompt = `
 
-You can look at the user's project with two read-only tools, list_dir and read_file. Use them only when the question depends on the user's own code, and look at as little as you need. Do not write any text before or between tool calls: call the tool silently, and write your answer only once you have what you need. If you used files, say which ones in your first sentences. If a tool is refused or fails, carry on without it and say what you assumed.`
+You can look at the user's project with two read-only tools, list_dir and read_file. Looking is slow for the user, who waits while you do it, so be sparing:
+- Use the tools only when the answer depends on the user's own code. For a general question, do not use them at all.
+- Make as few calls as possible, at most three, and always batch: ask for every file you need in a single read_file call with paths, and use list_dir with depth 2 or 3 instead of listing folder by folder.
+- Read only files that clearly matter. Never read everything, never read tests, lock files or generated files unless the question is about them, and stop as soon as you can answer.
+- Do not write any text before or between tool calls: call the tool silently, and write your answer once you have what you need. If you used files, say which ones in your first sentences.
+- If a tool is refused or fails, carry on without it and say what you assumed.`
 
 // roundResult is what one request to the model produced.
 type roundResult struct {

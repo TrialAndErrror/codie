@@ -19,12 +19,17 @@ import (
 // Limits that keep a single question from reading the whole disk or flooding
 // the model's context.
 const (
-	// MaxToolCalls is how many tool calls one question may make.
-	MaxToolCalls = 15
+	// MaxToolCalls is how many tool calls one question may make. It is small on
+	// purpose: every call is a full round trip to the model, so a long chain of
+	// them is minutes of waiting, and the tools below return a lot per call.
+	MaxToolCalls = 5
 
-	maxFileBytes   = 64 << 10 // read at most this much of a file per call
-	maxReadLines   = 400
+	maxFileBytes   = 32 << 10 // read at most this much of a file per call
+	maxReadLines   = 300      // lines of one file per call
+	maxMultiLines  = 120      // lines per file when several are read in one call
+	maxReadPaths   = 4        // files in one read_file call
 	maxListEntries = 200
+	maxListDepth   = 3
 )
 
 // FileTools lets the model look at files under one folder, read-only. Root is
@@ -71,23 +76,26 @@ func (f *FileTools) Specs() []toolSpec {
 	return []toolSpec{
 		{Type: "function", Function: toolFunction{
 			Name:        "list_dir",
-			Description: "List the files and folders in a folder of the user's project. Folders end with /. Use \".\" for the project root.",
+			Description: "List the files and folders in a folder of the user's project, as a tree if depth is more than 1 (use depth 2 or 3 on the project root to see the layout in one call). Folders end with /. Use \".\" for the project root.",
 			Parameters: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"path": str("Folder path relative to the project root.")},
-				"required":   []string{"path"},
+				"type": "object",
+				"properties": map[string]any{
+					"path":  str("Folder path relative to the project root."),
+					"depth": map[string]any{"type": "integer", "description": "How many levels to show, 1 to 3. Defaults to 1."},
+				},
+				"required": []string{"path"},
 			},
 		}},
 		{Type: "function", Function: toolFunction{
 			Name:        "read_file",
-			Description: "Read a text file from the user's project. Long files are cut off; pass start_line to continue.",
+			Description: "Read text files from the user's project. To save time, name every file you need in one call with paths (up to 4; each is cut off after 120 lines). A single path gives up to 300 lines; pass start_line to continue it.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path":       str("File path relative to the project root."),
-					"start_line": map[string]any{"type": "integer", "description": "1-based line to start from. Defaults to 1."},
+					"path":       str("One file path relative to the project root."),
+					"paths":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Several file paths to read in one call."},
+					"start_line": map[string]any{"type": "integer", "description": "1-based line to start from (single path only). Defaults to 1."},
 				},
-				"required": []string{"path"},
 			},
 		}},
 	}
@@ -98,17 +106,37 @@ func (f *FileTools) Specs() []toolSpec {
 // status line for the user ("reading cli/main.go").
 func (f *FileTools) Run(name, argsJSON string) (result, activity string) {
 	var args struct {
-		Path      string `json:"path"`
-		StartLine int    `json:"start_line"`
+		Path      string   `json:"path"`
+		Paths     []string `json:"paths"`
+		StartLine int      `json:"start_line"`
+		Depth     int      `json:"depth"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return "error: the arguments were not valid JSON", "reading a file"
 	}
 	switch name {
 	case "list_dir":
-		return f.listDir(args.Path), activityFor("listing", args.Path)
+		return f.listDir(args.Path, args.Depth), activityFor("listing", args.Path)
 	case "read_file":
-		return f.readFile(args.Path, args.StartLine), activityFor("reading", args.Path)
+		paths := args.Paths
+		if args.Path != "" {
+			paths = append([]string{args.Path}, paths...)
+		}
+		if len(paths) == 0 {
+			return "error: give a path, or paths for several files", "reading a file"
+		}
+		if len(paths) == 1 {
+			return f.readFile(paths[0], args.StartLine, maxReadLines), activityFor("reading", paths[0])
+		}
+		paths = paths[:min(len(paths), maxReadPaths)]
+		var b strings.Builder
+		for i, p := range paths {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(f.readFile(p, 1, maxMultiLines))
+		}
+		return b.String(), activityFor("reading", strings.Join(paths, ", "))
 	}
 	return "error: unknown tool " + Sanitize(name), "using an unknown tool"
 }
@@ -158,16 +186,22 @@ func (f *FileTools) resolveBasic(p string) (abs, rel string, err error) {
 	return real, rel, nil
 }
 
-func (f *FileTools) listDir(p string) string {
-	abs, rel, err := f.resolve(p)
-	if err != nil {
-		return "error: " + err.Error()
-	}
+// child is one visible entry of a folder.
+type child struct {
+	name  string
+	rel   string
+	isDir bool
+}
+
+// children lists a folder's entries the model may see: sorted, with secrets,
+// escaping symlinks and .gitignored entries removed.
+func (f *FileTools) children(abs string) ([]child, error) {
 	entries, err := os.ReadDir(abs)
 	if err != nil {
-		return "error: not a readable folder"
+		return nil, err
 	}
-	var names, rels []string
+	var out []child
+	var rels []string
 	for _, e := range entries {
 		// Resolve each entry so a symlink pointing outside the root, or at a
 		// secret, is hidden rather than listed.
@@ -175,39 +209,81 @@ func (f *FileTools) listDir(p string) string {
 		if err != nil {
 			continue
 		}
-		name := e.Name()
-		if fi, err := os.Stat(filepath.Join(abs, name)); err == nil && fi.IsDir() {
-			name += "/"
+		c := child{name: e.Name(), rel: erel}
+		if fi, err := os.Stat(filepath.Join(abs, c.name)); err == nil && fi.IsDir() {
+			c.isDir = true
 		}
-		names = append(names, name)
+		out = append(out, c)
 		rels = append(rels, erel)
 	}
 	if skip := f.ignored(rels); len(skip) > 0 {
-		kept := names[:0]
-		for i, n := range names {
-			if !skip[rels[i]] {
-				kept = append(kept, n)
+		kept := out[:0]
+		for _, c := range out {
+			if !skip[c.rel] {
+				kept = append(kept, c)
 			}
 		}
-		names = kept
+		out = kept
 	}
-	sort.Strings(names)
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	return out, nil
+}
+
+// noiseDirs are never worth descending into when showing a tree.
+var noiseDirs = map[string]bool{"node_modules": true, "__pycache__": true, ".venv": true, "venv": true}
+
+func (f *FileTools) listDir(p string, depth int) string {
+	abs, rel, err := f.resolve(p)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	depth = min(max(depth, 1), maxListDepth)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s:\n", displayRel(rel))
-	for i, n := range names {
-		if i == maxListEntries {
-			fmt.Fprintf(&b, "… and %d more\n", len(names)-i)
-			break
-		}
-		b.WriteString(n + "\n")
+	budget := maxListEntries
+	if err := f.writeTree(&b, abs, depth, 0, &budget); err != nil {
+		return "error: not a readable folder"
 	}
-	if len(names) == 0 {
-		b.WriteString("(empty)\n")
+	if budget < 0 {
+		b.WriteString("… more entries not shown\n")
 	}
 	return b.String()
 }
 
-func (f *FileTools) readFile(p string, start int) string {
+// writeTree lists a folder's entries, indented by level, descending into
+// subfolders until depth levels are shown. budget counts the entries left to
+// print across the whole tree and goes negative once it ran out.
+func (f *FileTools) writeTree(b *strings.Builder, abs string, depth, level int, budget *int) error {
+	kids, err := f.children(abs)
+	if err != nil {
+		return err
+	}
+	if len(kids) == 0 && level == 0 {
+		b.WriteString("(empty)\n")
+	}
+	for _, c := range kids {
+		if *budget <= 0 {
+			*budget = -1
+			return nil
+		}
+		*budget--
+		name := c.name
+		if c.isDir {
+			name += "/"
+		}
+		b.WriteString(strings.Repeat("  ", level) + name + "\n")
+		if c.isDir && level+1 < depth && !noiseDirs[c.name] {
+			// A subfolder that can't be read is skipped, not fatal.
+			_ = f.writeTree(b, filepath.Join(abs, c.name), depth, level+1, budget)
+			if *budget < 0 {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (f *FileTools) readFile(p string, start, maxLines int) string {
 	abs, rel, err := f.resolve(p)
 	if err != nil {
 		return "error: " + err.Error()
@@ -243,7 +319,7 @@ func (f *FileTools) readFile(p string, start int) string {
 	if start > len(lines) {
 		return fmt.Sprintf("error: the file has only %d lines", len(lines))
 	}
-	end := min(start-1+maxReadLines, len(lines))
+	end := min(start-1+maxLines, len(lines))
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (lines %d-%d)\n", displayRel(rel), start, end)
 	for _, l := range lines[start-1 : end] {

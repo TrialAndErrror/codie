@@ -230,15 +230,16 @@ approval again. Enter is ignored while streaming or after a failure (`canFollowU
 
 Real mode only (demo has no tools). `realRuntime` sets `OpenRouter.Files` =
 `NewFileTools(os.Getwd())`: **the root is the folder Codie was launched from and its
-children** (not the git root; the user asked for exactly that). Tools: `list_dir(path)`,
-`read_file(path, start_line?)`. `OpenRouter.Files == nil` means no tools are sent at all.
+children** (not the git root; the user asked for exactly that). Tools: `list_dir(path, depth?)`
+(depth 1-3 prints an indented tree; `node_modules`, `venv` etc. are not descended) and
+`read_file(path | paths[<=4], start_line?)`. `OpenRouter.Files == nil` means no tools are sent at all.
 
 - **Loop:** `run` calls `round` (one streamed request). Tool-call arguments arrive in
   fragments by `index` and are reassembled. If the reply has calls, it asks for approval
   (once per question, before the first read), runs them, appends the assistant + `tool`
   messages, and requests again, until a reply has no calls. `filesPrompt` is appended to
-  the system prompt only when tools are on (it asks for no text before/between tool
-  calls; a model that ignores that leaks chatter into the answer).
+  the system prompt only when tools are on (it asks the model to be sparing: at most three calls, batch with `paths` and `depth`,
+  read only what matters, no text before/between tool calls; a model that ignores that leaks chatter into the answer).
 - **Approval:** an `Approval` event with a buffered `Reply` chan. The idle watchdog is
   stopped while waiting on the person. **No** → tool results say so, no file is read,
   and tools are no longer offered. Cancel while waiting ends the stream silently.
@@ -251,9 +252,14 @@ children** (not the git root; the user asked for exactly that). Tools: `list_dir
   behave as for the user, a root inside a bigger repo works, and `list_dir` checks a whole
   folder in one call. Tracked files are not "ignored" (git's rule). If git is missing or
   the root isn't in a repo, nothing is excluded (fails open; the approval prompt remains).
-  Limits: 15 calls per question (`MaxToolCalls`; then
-  tools are withdrawn), 64 KB and 400 lines per read (`start_line` continues), binary
-  files refused, 200 list entries. Errors go back to the model as text, never as `Error`.
+  Limits: 5 calls per question (`MaxToolCalls`; then
+  tools are withdrawn), 32 KB per file, 300 lines for a single-file read (`start_line`
+  continues), 120 lines per file when several are read, binary files refused, 200 list
+  entries in total. Errors go back to the model as text, never as `Error`.
+- **Why so few calls:** each tool call is a full model round trip over a growing context, so
+  small/slow models spend minutes on a chain of one-file reads. The cap, the batching
+  tools and the prompt exist to keep a file-assisted answer to about two round trips.
+  If reads feel slow again, look at round trips first, not file sizes.
 - **Not done:** files read are not recorded in history; no
   content search tool; a check-then-open race on the path exists (single local user).
   Note file contents go to the model provider, so the ZDR caveats in section 9 apply to them too.

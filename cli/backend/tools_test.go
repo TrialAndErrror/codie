@@ -129,11 +129,12 @@ func TestReadFileLimits(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "huge.txt"), []byte(strings.Repeat("x", maxFileBytes*2)), 0o644)
 
 	got, _ := ft.Run("read_file", `{"path":"long.txt"}`)
-	if !strings.Contains(got, "line 400\n") || strings.Contains(got, "line 401\n") || !strings.Contains(got, "start_line=401") {
+	last, next := fmt.Sprintf("line %d\n", maxReadLines), fmt.Sprintf("line %d\n", maxReadLines+1)
+	if !strings.Contains(got, last) || strings.Contains(got, next) || !strings.Contains(got, fmt.Sprintf("start_line=%d", maxReadLines+1)) {
 		t.Errorf("line cap/continuation wrong:\n%.200s…", got[max(len(got)-200, 0):])
 	}
-	got, _ = ft.Run("read_file", `{"path":"long.txt","start_line":401}`)
-	if !strings.Contains(got, "line 401\n") || strings.Contains(got, "line 400\n") {
+	got, _ = ft.Run("read_file", fmt.Sprintf(`{"path":"long.txt","start_line":%d}`, maxReadLines+1))
+	if !strings.Contains(got, next) || strings.Contains(got, last) {
 		t.Errorf("start_line ignored")
 	}
 	if got, _ = ft.Run("read_file", `{"path":"bin.dat"}`); !strings.Contains(got, "binary") {
@@ -416,5 +417,96 @@ func TestOutsideARepoNothingIsIgnored(t *testing.T) {
 	ft, _, _ := project(t) // not a git repo
 	if got := ft.ignored([]string{"main.go"}); len(got) != 0 {
 		t.Errorf("ignored outside a repo: %v", got)
+	}
+}
+
+func TestReadSeveralFilesInOneCall(t *testing.T) {
+	ft, root, _ := project(t)
+	var long strings.Builder
+	for i := 1; i <= 500; i++ {
+		fmt.Fprintf(&long, "row %d\n", i)
+	}
+	os.WriteFile(filepath.Join(root, "long.txt"), []byte(long.String()), 0o644)
+
+	got, act := ft.Run("read_file", `{"paths":["main.go","sub/a.txt","long.txt",".env"]}`)
+	for _, want := range []string{"func main()", "hello", "row 1\n", fmt.Sprintf("row %d\n", maxMultiLines)} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%.300s", want, got)
+		}
+	}
+	if strings.Contains(got, fmt.Sprintf("row %d\n", maxMultiLines+1)) {
+		t.Errorf("per-file cap not applied in a multi read")
+	}
+	if strings.Contains(got, "hunter2") || !strings.Contains(got, "error:") {
+		t.Errorf("a blocked file in a batch must be refused, not leaked:\n%s", got)
+	}
+	if !strings.Contains(act, "main.go") || !strings.Contains(act, "sub/a.txt") {
+		t.Errorf("activity: %q", act)
+	}
+
+	// More paths than allowed: the extras are not read.
+	many := `{"paths":["main.go","sub/a.txt","main.go","sub/a.txt","long.txt"]}`
+	if got, _ := ft.Run("read_file", many); strings.Contains(got, "row 1\n") {
+		t.Errorf("read more than %d paths", maxReadPaths)
+	}
+	// path and paths together are both honoured.
+	if got, _ := ft.Run("read_file", `{"path":"main.go","paths":["sub/a.txt"]}`); !strings.Contains(got, "func main()") || !strings.Contains(got, "hello") {
+		t.Errorf("path+paths: %q", got)
+	}
+	if got, _ := ft.Run("read_file", `{}`); !strings.HasPrefix(got, "error:") {
+		t.Errorf("no path: %q", got)
+	}
+}
+
+func TestListDirDepth(t *testing.T) {
+	ft, root, _ := project(t)
+	os.MkdirAll(filepath.Join(root, "sub", "deep", "deeper"), 0o755)
+	os.WriteFile(filepath.Join(root, "sub", "deep", "d.txt"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(root, "sub", "deep", "deeper", "e.txt"), []byte("x"), 0o644)
+	os.MkdirAll(filepath.Join(root, "node_modules", "pkg"), 0o755)
+
+	flat, _ := ft.Run("list_dir", `{"path":"."}`)
+	if strings.Contains(flat, "a.txt") {
+		t.Errorf("depth 1 should not descend:\n%s", flat)
+	}
+	two, _ := ft.Run("list_dir", `{"path":".","depth":2}`)
+	if !strings.Contains(two, "\n  a.txt\n") || !strings.Contains(two, "  deep/\n") || strings.Contains(two, "d.txt") {
+		t.Errorf("depth 2:\n%s", two)
+	}
+	three, _ := ft.Run("list_dir", `{"path":".","depth":99}`) // clamped to 3
+	if !strings.Contains(three, "d.txt") || strings.Contains(three, "e.txt") {
+		t.Errorf("depth clamp:\n%s", three)
+	}
+	if strings.Contains(three, "pkg") {
+		t.Errorf("node_modules should not be descended:\n%s", three)
+	}
+	// Secrets and escapes stay hidden in a tree too.
+	for _, line := range strings.Split(three, "\n") {
+		switch strings.TrimSpace(line) {
+		case ".env", "link-out/", "link-file", "link-env", ".git/", "server.pem":
+			t.Errorf("tree shows %q:\n%s", line, three)
+		}
+	}
+}
+
+func TestListTreeIsCapped(t *testing.T) {
+	ft, root, _ := project(t)
+	for i := 0; i < maxListEntries+50; i++ {
+		os.WriteFile(filepath.Join(root, "sub", fmt.Sprintf("f%03d.txt", i)), nil, 0o644)
+	}
+	got, _ := ft.Run("list_dir", `{"path":".","depth":3}`)
+	if n := strings.Count(got, "\n"); n > maxListEntries+5 || !strings.Contains(got, "more entries not shown") {
+		t.Errorf("tree not capped (%d lines)", n)
+	}
+}
+
+func TestPromptAsksForSparingReads(t *testing.T) {
+	for _, want := range []string{"at most three", "paths", "depth", "Never read everything"} {
+		if !strings.Contains(filesPrompt, want) {
+			t.Errorf("filesPrompt lost %q", want)
+		}
+	}
+	if MaxToolCalls > 6 {
+		t.Errorf("MaxToolCalls = %d; a long chain of calls is what makes reads slow", MaxToolCalls)
 	}
 }
